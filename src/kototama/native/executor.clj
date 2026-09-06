@@ -1051,8 +1051,7 @@
 (defn invoke
   "Execute one export of a prepared session. Returns measured supervisor
   evidence in the same shape `execute` returns."
-  [session policy input {:keys [now entry]
-                         kotoba.kbb/fs-app-data-scopes :kotoba.kbb/fs-app-data-scopes}]
+  [session policy input {:keys [now entry] :as opts}]
   (let [{:keys [artifact runtime host-backend host-os code-file loader]} session
         entry (or entry 'main)
         export (get (:exports artifact) entry)

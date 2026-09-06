@@ -606,11 +606,11 @@
 
   Wire id 35 (the loader's fs_app_data_read_provider) reads its granted
   scope from the KEXE_CAP_RESOURCES_35 environment variable (a colon-separated
-  list). The kbb native backend carries the scope on the invoke policy under
-  :kotoba.kbb/fs-app-data-scopes; it is surfaced here so the loader provider
-  can enforce it. A missing scope (no 35 grant) adds nothing."
-  [policy env]
-  (let [scopes (-> policy :kotoba.kbb/fs-app-data-scopes)]
+  list). The kbb native backend carries the scope on the invoke OPTS under
+  :kotoba.kbb/fs-app-data-scopes (kept out of the POLICY, because amu
+  admission rejects unrecognised policy keys). A missing scope adds nothing."
+  [opts env]
+  (let [scopes (-> opts :kotoba.kbb/fs-app-data-scopes)]
     (if (or (nil? scopes) (empty? scopes))
       env
       (assoc env "KEXE_CAP_RESOURCES_35" (str/join ":" (sort scopes))))))
@@ -1051,7 +1051,8 @@
 (defn invoke
   "Execute one export of a prepared session. Returns measured supervisor
   evidence in the same shape `execute` returns."
-  [session policy input {:keys [now entry]}]
+  [session policy input {:keys [now entry]
+                         kotoba.kbb/fs-app-data-scopes :kotoba.kbb/fs-app-data-scopes}]
   (let [{:keys [artifact runtime host-backend host-os code-file loader]} session
         entry (or entry 'main)
         export (get (:exports artifact) entry)
@@ -1081,7 +1082,7 @@
                              (str (:offset export)) (str (:arity export)) isa allow]
                             (map str args))
               started-at (quot (System/currentTimeMillis) 1000)
-              process (run-process command (fs-app-data-scope-env policy (runtime-environment host-os result))
+              process (run-process command (fs-app-data-scope-env opts (runtime-environment host-os result))
                                    {:timeout-ms (if (= :windows host-os) 60000 5000)
                                     :output-limit (if (= :string result) 160000 65536)})
               finished-at (quot (System/currentTimeMillis) 1000)

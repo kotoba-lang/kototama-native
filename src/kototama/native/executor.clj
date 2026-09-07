@@ -997,7 +997,7 @@
                    (= (:isa artifact-profile) (:isa runtime-profile))
                    (= (:abi artifact-profile) (:abi runtime-profile))
                    (contains? #{:unspecified (:os runtime-profile)} (:os artifact-profile))
-                   (or (= :kotoba-supervisor-v1 (:runtime artifact-profile))
+                   (or (= :kototama-supervisor-v1 (:runtime artifact-profile))
                        (= (:runtime artifact-profile) (:runtime runtime-profile))))
       (throw (ex-info "artifact and runtime target profiles do not match"
                       {:phase :runtime-identity})))

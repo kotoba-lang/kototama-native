@@ -734,23 +734,33 @@
                             (contains? #{:option-i64 :result-i64}
                                        (:result-type report)))
         variant-result? (and (= status :ok) (= :variant (:result-type report)))
+        ;; `:vectors` and `:vector-items` joined every report on 2026-09-08
+        ;; (amu kexe_loader.c, artifact 678c0095). They are not decoration:
+        ;; the loader's two vector arenas are separately exhaustible and were
+        ;; the only bounded resource a run could hit without the report
+        ;; mentioning it -- exhaustion arrived as a bare SIGILL beside a
+        ;; `:heap` line about the PAIR arena, which vector work never touches.
         expected-keys (case status
                         :ok (cond
                               string-result?
-                              #{:status :result :result-type :result-utf8-hex :fuel :heap}
+                              #{:status :result :result-type :result-utf8-hex :fuel :heap
+                                :vectors :vector-items}
                               record-result?
-                              #{:status :result :result-type :result-words :fuel :heap}
+                              #{:status :result :result-type :result-words :fuel :heap
+                                :vectors :vector-items}
                               tagged-result?
                               #{:status :result :result-type :result-tag :result-word
-                                :fuel :heap}
+                                :fuel :heap :vectors :vector-items}
                               variant-result?
                               #{:status :result :result-type :result-ordinal :result-word
-                                :fuel :heap}
-                              :else #{:status :result :fuel :heap})
-                        :trap #{:status :exit :fuel :heap}
+                                :fuel :heap :vectors :vector-items}
+                              :else #{:status :result :fuel :heap :vectors :vector-items})
+                        :trap #{:status :exit :fuel :heap :vectors :vector-items}
                         nil)
         fuel (:fuel report)
-        heap (:heap report)]
+        heap (:heap report)
+        vectors (:vectors report)
+        vector-items (:vector-items report)]
     (and (map? report)
          (= expected-keys (set (keys report)))
          (= (zero? exit) (= status :ok))
@@ -760,6 +770,21 @@
          (= #{:capacity :used} (set (keys heap)))
          (= 4096 (:capacity heap))
          (integer? (:used heap)) (<= 0 (:used heap) 4096)
+         ;; Structure and bounds, NOT the constant. `:fuel` and `:heap` above
+         ;; pin their defaults because this executor always runs at them; the
+         ;; vector arenas are a per-run budget (KEXE_VECTOR_CAPACITY /
+         ;; KEXE_VECTOR_ITEM_CAPACITY), so pinning 4096 and 65536 here would
+         ;; make this validator refuse every run that raised one -- which is
+         ;; the whole point of their being raisable. What must hold either way
+         ;; is that the loader reports a capacity it could allocate and a use
+         ;; inside it.
+         (= #{:capacity :used} (set (keys vectors)))
+         (integer? (:capacity vectors)) (pos? (:capacity vectors))
+         (integer? (:used vectors)) (<= 0 (:used vectors) (:capacity vectors))
+         (= #{:capacity :used} (set (keys vector-items)))
+         (integer? (:capacity vector-items)) (pos? (:capacity vector-items))
+         (integer? (:used vector-items))
+         (<= 0 (:used vector-items) (:capacity vector-items))
          (or (not= status :trap) (= exit (:exit report)))
          (or (not= status :ok) (integer? (:result report)))
          (or (not string-result?)

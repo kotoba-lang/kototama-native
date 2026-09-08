@@ -9,29 +9,42 @@
 
 (deftest supervisor-report-validation-is-closed-and-bounded
   (let [valid? @#'executor/valid-supervisor-report?
-        ok {:status :ok :result 7
-            :fuel {:initial 512 :remaining 500}
-            :heap {:capacity 4096 :used 32}}
-        string-ok {:status :ok :result 3 :result-type :string
-                   :result-utf8-hex "6869f09f9880"
-                   :fuel {:initial 512 :remaining 499}
-                   :heap {:capacity 4096 :used 33}}
-        record-ok {:status :ok :result 9 :result-type :record
-                   :result-words [-7 1]
-                   :fuel {:initial 512 :remaining 498}
-                   :heap {:capacity 4096 :used 34}}
-        option-ok {:status :ok :result 10 :result-type :option-i64
-                   :result-tag true :result-word Long/MIN_VALUE
-                   :fuel {:initial 512 :remaining 497}
-                   :heap {:capacity 4096 :used 35}}
-        result-ok {:status :ok :result 11 :result-type :result-i64
-                   :result-tag false :result-word Long/MAX_VALUE
-                   :fuel {:initial 512 :remaining 496}
-                   :heap {:capacity 4096 :used 36}}
-        variant-ok {:status :ok :result 12 :result-type :variant
-                    :result-ordinal 1 :result-word 1
-                    :fuel {:initial 512 :remaining 495}
-                    :heap {:capacity 4096 :used 37}}]
+        ;; Every report carries the loader's two vector arenas from
+        ;; 2026-09-08 (amu kexe_loader.c, artifact 678c0095). Spliced in
+        ;; rather than written out six times, so a later shape change is one
+        ;; line -- and so the six fixtures below still read as being about
+        ;; the result types they are named for.
+        arenas {:vectors {:capacity 4096 :used 0}
+                :vector-items {:capacity 65536 :used 0}}
+        ok (merge arenas
+                  {:status :ok :result 7
+                   :fuel {:initial 512 :remaining 500}
+                   :heap {:capacity 4096 :used 32}})
+        string-ok (merge arenas
+                         {:status :ok :result 3 :result-type :string
+                          :result-utf8-hex "6869f09f9880"
+                          :fuel {:initial 512 :remaining 499}
+                          :heap {:capacity 4096 :used 33}})
+        record-ok (merge arenas
+                         {:status :ok :result 9 :result-type :record
+                          :result-words [-7 1]
+                          :fuel {:initial 512 :remaining 498}
+                          :heap {:capacity 4096 :used 34}})
+        option-ok (merge arenas
+                         {:status :ok :result 10 :result-type :option-i64
+                          :result-tag true :result-word Long/MIN_VALUE
+                          :fuel {:initial 512 :remaining 497}
+                          :heap {:capacity 4096 :used 35}})
+        result-ok (merge arenas
+                         {:status :ok :result 11 :result-type :result-i64
+                          :result-tag false :result-word Long/MAX_VALUE
+                          :fuel {:initial 512 :remaining 496}
+                          :heap {:capacity 4096 :used 36}})
+        variant-ok (merge arenas
+                          {:status :ok :result 12 :result-type :variant
+                           :result-ordinal 1 :result-word 1
+                           :fuel {:initial 512 :remaining 495}
+                           :heap {:capacity 4096 :used 37}})]
     (is (true? (valid? ok 0)))
     (is (true? (valid? string-ok 0)))
     (is (false? (valid? (assoc string-ok :result-utf8-hex "ff") 0)))
@@ -54,7 +67,19 @@
     (is (false? (valid? (assoc variant-ok :result-case :ready) 0)))
     (is (false? (valid? (assoc-in ok [:fuel :remaining] 513) 0)))
     (is (false? (valid? (assoc ok :ambient "forbidden") 0)))
-    (is (false? (valid? ok 1)))))
+    (is (false? (valid? ok 1)))
+    ;; The arenas are validated by SHAPE and BOUNDS, not against the default
+    ;; capacity: they are a per-run budget (KEXE_VECTOR_CAPACITY /
+    ;; KEXE_VECTOR_ITEM_CAPACITY), so pinning 4096 here would refuse every run
+    ;; that raised one -- which is what raisable means.
+    (is (true? (valid? (assoc ok :vectors {:capacity 1200000 :used 1165132}) 0))
+        "a raised budget is still a valid report")
+    (is (false? (valid? (dissoc ok :vectors) 0))
+        "and the report is still closed: a missing arena is not optional")
+    (is (false? (valid? (assoc ok :vectors {:capacity 4096 :used 4097}) 0))
+        "used past capacity is not a report the loader can produce")
+    (is (false? (valid? (assoc ok :vectors {:capacity 0 :used 0}) 0)))
+    (is (false? (valid? (assoc ok :vector-items {:capacity 65536}) 0)))))
 
 (deftest entryless-export-contract-is-read-from-the-selected-function
   (let [contract @#'executor/entry-contract

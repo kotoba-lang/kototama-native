@@ -1,7 +1,7 @@
 (ns kototama.native.executor
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [kotoba.kir.admission :as admission]
             [kotoba.artifact.core :as artifact]
             [kotoba.artifact.runtime-identity :as runtime-identity]
@@ -19,7 +19,7 @@
 (def loader-source-sha256 runtime-identity/loader-source-sha256)
 (def windows-loader-source-sha256 runtime-identity/windows-loader-source-sha256)
 
-(defn- windows-host? [] (= :windows (let [os (str/lower-case (System/getProperty "os.name"))]
+(defn- windows-host? [] (= :windows (let [os (str/lower (System/getProperty "os.name"))]
                                       (when (str/includes? os "win") :windows))))
 
 (defn- raw-sha256 [bytes]
@@ -52,8 +52,8 @@
     (.toRealPath ^Path candidate (make-array LinkOption 0))))
 
 (defn- host-target []
-  (let [os (str/lower-case (System/getProperty "os.name"))
-        arch (str/lower-case (System/getProperty "os.arch"))]
+  (let [os (str/lower (System/getProperty "os.name"))
+        arch (str/lower (System/getProperty "os.arch"))]
     (when-not (or (str/includes? os "linux") (str/includes? os "mac")
                   (str/includes? os "win"))
       (throw (ex-info "native execution is unsupported on this OS"
@@ -65,7 +65,7 @@
                             {:phase :execute :arch arch})))))
 
 (defn- host-os []
-  (let [os (str/lower-case (System/getProperty "os.name"))]
+  (let [os (str/lower (System/getProperty "os.name"))]
     (cond
       (str/includes? os "linux") :linux
       (str/includes? os "mac") :macos
@@ -152,7 +152,7 @@
         host-env (when (windows-host?)
                    (into {}
                          (remove (fn [[name _]]
-                                   (contains? injection-vars (str/upper-case name))))
+                                   (contains? injection-vars (str/upper name))))
                          (System/getenv)))
         windows-vars (when (windows-host?)
                        (into {}

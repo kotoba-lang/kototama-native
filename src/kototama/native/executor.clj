@@ -792,22 +792,23 @@
                         :ok (cond
                               string-result?
                               #{:status :result :result-type :result-utf8-hex :fuel :heap
-                                :vectors :vector-items}
+                                :string-pool :vectors :vector-items}
                               record-result?
                               #{:status :result :result-type :result-words :fuel :heap
-                                :vectors :vector-items}
+                                :string-pool :vectors :vector-items}
                               tagged-result?
                               #{:status :result :result-type :result-tag :result-word
-                                :fuel :heap :vectors :vector-items}
+                                :fuel :heap :string-pool :vectors :vector-items}
                               variant-result?
                               #{:status :result :result-type :result-ordinal :result-word
-                                :fuel :heap :vectors :vector-items}
-                              :else #{:status :result :fuel :heap :vectors :vector-items})
-                        :trap #{:status :exit :fuel :heap :vectors :vector-items}
+                                :fuel :heap :string-pool :vectors :vector-items}
+                              :else #{:status :result :fuel :heap :string-pool :vectors :vector-items})
+                        :trap #{:status :exit :fuel :heap :string-pool :vectors :vector-items}
                         nil)
         fuel (:fuel report)
         heap (:heap report)
         vectors (:vectors report)
+        string-pool (:string-pool report)
         vector-items (:vector-items report)]
     (and (map? report)
          (= expected-keys (set (keys report)))
@@ -826,6 +827,17 @@
          ;; the whole point of their being raisable. What must hold either way
          ;; is that the loader reports a capacity it could allocate and a use
          ;; inside it.
+         ;; `:string-pool` joined every report on 2026-09-10 (amu
+         ;; kexe_loader.c, identity 65f001ee). Structure and bounds, NOT the
+         ;; constant, for the same reason as the vector arenas below: it is a
+         ;; per-run budget (KEXE_STRING_POOL), so pinning 65536 would refuse
+         ;; every run that raised it. It is in the report at all because a
+         ;; guest that exhausted the string arena previously had NO line to
+         ;; read -- exhaustion arrived as a bare trap beside a `:heap` line
+         ;; about the pair arena, which string work does not touch.
+         (= #{:capacity :used} (set (keys string-pool)))
+         (integer? (:capacity string-pool)) (pos? (:capacity string-pool))
+         (integer? (:used string-pool)) (<= 0 (:used string-pool) (:capacity string-pool))
          (= #{:capacity :used} (set (keys vectors)))
          (integer? (:capacity vectors)) (pos? (:capacity vectors))
          (integer? (:used vectors)) (<= 0 (:used vectors) (:capacity vectors))

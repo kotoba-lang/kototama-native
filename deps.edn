@@ -26,7 +26,11 @@
          ;; together or every attested run is rejected as malformed evidence.
          ;; Corrected 2026-09-10, 7bff9bac -> 97cd1e33: 7bff9bac's docstring
          ;; closed early on a raw quote and did not compile.
-         :git/sha "97cd1e331579437c9b1886f41ef93c31570a58cf"}
+         ;; Advanced 2026-09-10, 97cd1e33 -> 15f488d2: the WINDOWS loader
+         ;; identity now names a loader that reports :string-pool, which the
+         ;; validator above requires of every report. Both loaders must move
+         ;; before either can pair with this file.
+         :git/sha "15f488d2673b81993a41d7f35b51d6fd879b8490"}
         io.github.kotoba-lang/kotoba-verifier
         {:git/url "https://github.com/kotoba-lang/kotoba-verifier.git"
          :git/sha "83057552f03a8021c6523e8e38ad7439b1953522"}}

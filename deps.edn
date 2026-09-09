@@ -10,7 +10,14 @@
          :git/sha "f12591011fd0d55d25c2cfba37364338487e70e3"}
         io.github.kotoba-lang/artifact
         {:git/url "https://github.com/kotoba-lang/artifact.git"
-         :git/sha "e6c9cfa86e3943d51ba84f4c98ba2ec57765f9d3"}
+         ;; Advanced 2026-09-09, e6c9cfa8 -> 7e55cc39 (artifact main, forward
+         ;; only). `loader-source-sha256` names the loader that has the
+         ;; `g:`/`gl:` region forms this file now emits. `build-runtime!`
+         ;; compares the reviewed source's sha against this pin and refuses a
+         ;; mismatch, so the two move together or every execution fails with
+         ;; "native loader source identity mismatch" -- which reads as a
+         ;; tampered loader and is a pin skew.
+         :git/sha "7e55cc394c58ac0de6d22bd938d0c42b6b4c3438"}
         io.github.kotoba-lang/kotoba-verifier
         {:git/url "https://github.com/kotoba-lang/kotoba-verifier.git"
          :git/sha "83057552f03a8021c6523e8e38ad7439b1953522"}}

@@ -637,6 +637,54 @@
                        :limit-bytes 65536})))
     (str "s:" (bytes->hex bytes))))
 
+;; granted regions: the host half of the loader's `g:`/`gl:` pair.
+;;
+;; `kotoba.verifier` 33b3d067 admits the slice memory subfamily on general
+;; native targets when every base is provably a PARAMETER -- a region the
+;; caller granted. Until the loader gained these forms there was no caller that
+;; could grant one: a `:string` argument arrives as a pair handle and a vector
+;; as an arena handle, and neither is an address.
+;;
+;; TWO HOST VALUES, NOT ONE, and that is deliberate. The entry really does take
+;; two machine words, `(:arity export)` is separately asserted against
+;; `(count param-types)`, and a host value that silently filled two parameter
+;; slots would make those two numbers stop meaning the same thing. So the
+;; caller writes what the entry takes:
+;;
+;;   {:args [{:region [1 2 3]} {:region-length 0}]}
+;;
+;; The LENGTH still comes from the loader, not from this map: `{:region-length
+;; 0}` is a REFERENCE to the zeroth region minted, and the loader answers with
+;; the length it recorded when it copied the bytes. A caller cannot grant a
+;; base together with a length that does not belong to it, which is the one way
+;; a granted region could become an ungranted one.
+(defn- region-argument? [value]
+  (and (map? value) (contains? value :region)))
+
+(defn- region-length-argument? [value]
+  (and (map? value) (contains? value :region-length)))
+
+(def ^:private region-pool-bytes 65536)
+
+(defn- region-argument-token [entry index value]
+  (let [bytes (:region value)]
+    (when-not (and (sequential? bytes)
+                   (every? #(and (integer? %) (<= 0 % 255)) bytes))
+      (throw (ex-info "execution region argument is not a sequence of bytes"
+                      {:phase :execute :entry entry :index index})))
+    (when (> (count bytes) region-pool-bytes)
+      (throw (ex-info "execution region exceeds the native host arena"
+                      {:phase :execute :entry entry :index index
+                       :bytes (count bytes) :limit-bytes region-pool-bytes})))
+    (str "g:" (bytes->hex (byte-array (mapv unchecked-byte bytes))))))
+
+(defn- region-length-argument-token [entry index value]
+  (let [ordinal (:region-length value)]
+    (when-not (and (integer? ordinal) (<= 0 ordinal 7))
+      (throw (ex-info "execution region-length argument does not name a region"
+                      {:phase :execute :entry entry :index index})))
+    (str "gl:" ordinal)))
+
 (defn- scalar-host-word [entry index field-name type value]
   (case type
     :i64 (if (and (integer? value) (<= Long/MIN_VALUE value Long/MAX_VALUE))
@@ -838,9 +886,21 @@
         (mapv (fn [index type value]
                 (cond
                   (= :i64 type)
-                  (if (and (integer? value)
-                           (<= Long/MIN_VALUE value Long/MAX_VALUE))
+                  (cond
+                    ;; granted regions: both forms occupy an `:i64` parameter,
+                    ;; because a base and a length ARE i64 words. What the host
+                    ;; may not do is compute either of them.
+                    (region-argument? value)
+                    (region-argument-token entry index value)
+
+                    (region-length-argument? value)
+                    (region-length-argument-token entry index value)
+
+                    (and (integer? value)
+                         (<= Long/MIN_VALUE value Long/MAX_VALUE))
                     value
+
+                    :else
                     (throw (ex-info "execution input does not match entry arguments (entry arity)"
                                     {:phase :execute :entry entry :index index
                                      :expected :i64})))

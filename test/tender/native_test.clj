@@ -1,5 +1,5 @@
 (ns tender.native-test
-  (:require [clojure.test :refer [deftest is]]
+  (:require [clojure.test :refer [deftest is testing]]
             [kototama.native.executor :as executor]))
 
 ;; Load gate: the split must not break namespace resolution. Each extracted
@@ -332,3 +332,68 @@
           "the Windows loader is a different file and is not substituted for")
       (finally
         (doseq [file (reverse (file-seq directory))] (clojure.java.io/delete-file file true))))))
+
+;; ---------------------------------------------------------------------------
+;; granted regions: the host half of the loader's `g:`/`gl:` pair
+;; ---------------------------------------------------------------------------
+;;
+;; `kotoba.verifier` 33b3d067 admits the slice memory subfamily on general
+;; native targets when every base is provably a PARAMETER -- a region the
+;; caller granted. These two forms are how a caller grants one; before them a
+;; `:string` argument arrived as a pair handle and a vector as an arena
+;; handle, and neither is an address.
+;;
+;; ⚠ These tests are about the TOKENS, not about execution. The end-to-end
+;; measurement is in amu, which owns the loader and can run one; it was taken
+;; on 2026-09-09 against the real kexe process on aarch64-macos -- a 64-byte
+;; granted region summed to 2080, a 10-byte one to 55, an empty one to 0, and
+;; a forward reference, an unminted length, odd hex and an over-pool region
+;; each exited 2 with no report.
+
+(deftest a-region-argument-becomes-the-loader-mint-form
+  (let [token @#'executor/region-argument-token]
+    (is (= "g:0102ff" (token 'e 0 {:region [1 2 255]})))
+    (testing "an empty region is a region, not an error -- its length is 0"
+      (is (= "g:" (token 'e 0 {:region []}))))))
+
+(deftest a-region-length-argument-is-a-REFERENCE-not-a-number
+  ;; The point of the pair: the host names WHICH region, and the loader
+  ;; answers with the length it recorded when it copied the bytes. A caller
+  ;; cannot grant a base together with a length that does not belong to it.
+  (let [token @#'executor/region-length-argument-token]
+    (is (= "gl:0" (token 'e 1 {:region-length 0})))
+    (is (= "gl:7" (token 'e 1 {:region-length 7})))))
+
+(deftest a-region-that-is-not-bytes-is-refused
+  (let [token @#'executor/region-argument-token]
+    (doseq [bad [{:region "0102"} {:region [1 2 256]} {:region [-1]}
+                 {:region [1 nil]} {:region 5}]]
+      (testing (pr-str bad)
+        (is (thrown? clojure.lang.ExceptionInfo (token 'e 0 bad)))))))
+
+(deftest a-region-past-the-pool-is-refused-here-and-not-only-at-the-loader
+  ;; The loader refuses it too, and that is the point -- a gate on one route
+  ;; is not a gate. Refusing here as well means the caller gets a message
+  ;; naming its own argument rather than an exit code from a child process.
+  (let [token @#'executor/region-argument-token]
+    (is (some? (token 'e 0 {:region (vec (repeat 65536 0))})))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (token 'e 0 {:region (vec (repeat 65537 0))})))))
+
+(deftest a-region-length-outside-the-loader-capacity-is-refused
+  (let [token @#'executor/region-length-argument-token]
+    (doseq [bad [{:region-length 8} {:region-length -1} {:region-length "0"}
+                 {:region-length nil}]]
+      (testing (pr-str bad)
+        (is (thrown? clojure.lang.ExceptionInfo (token 'e 1 bad)))))))
+
+(deftest the-two-forms-are-told-apart-by-their-key
+  (let [region? @#'executor/region-argument?
+        length? @#'executor/region-length-argument?]
+    (is (true? (boolean (region? {:region [1]}))))
+    (is (false? (boolean (region? {:region-length 0}))))
+    (is (true? (boolean (length? {:region-length 0}))))
+    (is (false? (boolean (length? {:region [1]}))))
+    (testing "and an ordinary integer is neither"
+      (is (false? (boolean (region? 42))))
+      (is (false? (boolean (length? 42)))))))

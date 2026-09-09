@@ -24,7 +24,9 @@
          ;; every report and why `valid-supervisor-report?` above learns it
          ;; in the same commit. Key-set equality is exact, so these two move
          ;; together or every attested run is rejected as malformed evidence.
-         :git/sha "7bff9bacf11c0c9444da3f60ac0f0c473c5c1164"}
+         ;; Corrected 2026-09-10, 7bff9bac -> 97cd1e33: 7bff9bac's docstring
+         ;; closed early on a raw quote and did not compile.
+         :git/sha "97cd1e331579437c9b1886f41ef93c31570a58cf"}
         io.github.kotoba-lang/kotoba-verifier
         {:git/url "https://github.com/kotoba-lang/kotoba-verifier.git"
          :git/sha "83057552f03a8021c6523e8e38ad7439b1953522"}}

@@ -30,7 +30,12 @@
          ;; identity now names a loader that reports :string-pool, which the
          ;; validator above requires of every report. Both loaders must move
          ;; before either can pair with this file.
-         :git/sha "15f488d2673b81993a41d7f35b51d6fd879b8490"}
+         ;; Advanced 2026-09-10, 15f488d2 -> db66a0908dc972492efd6c61208e56ba0e60cf96: the loader identity now
+         ;; names the loader with the six wire-35 mutation forms (mkdir,
+         ;; unlink, rmdir, rename, stat, chmod). build-runtime! hashes the
+         ;; reviewed source, so this moves with it or every native execution
+         ;; is refused as a tampered loader.
+         :git/sha "db66a0908dc972492efd6c61208e56ba0e60cf96"}
         io.github.kotoba-lang/kotoba-verifier
         {:git/url "https://github.com/kotoba-lang/kotoba-verifier.git"
          :git/sha "83057552f03a8021c6523e8e38ad7439b1953522"}}

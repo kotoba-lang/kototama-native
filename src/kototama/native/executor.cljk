@@ -103,8 +103,16 @@
      :cljs (.-length bytes)))
 
 #?(:cljs
-   (defn- regular-file? [p]
-     (try (let [stat (.lstatSync fs p)] (.isFile stat)) (catch :default _ false))))
+   (defn- regular-file?
+     "A regular file, symlinks FOLLOWED -- `statSync`, not `lstatSync`. The
+     JVM branch's `Files/isRegularFile` without `NOFOLLOW_LINKS` follows too,
+     and the difference is not academic: on Ubuntu `/usr/bin/cc` is a
+     symlink into `/etc/alternatives`, so with `lstat` the PATH walk found no
+     compiler at all (measured 2026-09-11 on amu's ubuntu runners; macOS's
+     `/usr/bin/cc` is a regular file and passed). The compiler-resource walk
+     that must NOT follow symlinks has its own `lstatSync` in `walk-tree`."
+     [p]
+     (try (let [stat (.statSync fs p)] (.isFile stat)) (catch :default _ false))))
 
 #?(:cljs
    (defn- executable-file? [p]

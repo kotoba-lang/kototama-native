@@ -103,7 +103,7 @@ Two things the Node host does that the JVM host did not:
 
 ## Test
 
-The Node suite (66 assertions on the decisions: report validation, argument
+The Node suite (68 assertions on the decisions: report validation, argument
 lowering, result boxing, the Make dependency parser, bigint handling) runs on
 the nbb engine with the executor's closure on the classpath. amu's lock is
 that closure already resolved:

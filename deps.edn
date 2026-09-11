@@ -3,7 +3,10 @@
         ;; kotoba.lang.text, not clojure.string. Pinned as an explicit floor:
         ;; tools.deps takes the NEWEST sha it is shown, so without a floor here
         ;; this repo silently rides whatever a sibling happens to name.
-        io.github.kotoba-lang/text {:git/sha "73bdb13ae7a3d004b44bca08be03a3191157a38f"}
+        ;; Advanced 2026-09-11, 73bdb13a -> 3dcb2ab0 (text main, forward
+        ;; only: 22 ahead, 0 behind) -- the sha amu's deps-lock.edn resolves,
+        ;; which is the closure the Node host of this executor was measured on.
+        io.github.kotoba-lang/text {:git/sha "3dcb2ab087933dc7b703b340dac9afce62cb30ff"}
        org.clojure/clojure {:mvn/version "1.12.0"}
         io.github.kotoba-lang/osaho
         {:git/url "https://github.com/kotoba-lang/osaho.git"
@@ -38,7 +41,11 @@
          :git/sha "db66a0908dc972492efd6c61208e56ba0e60cf96"}
         io.github.kotoba-lang/kotoba-verifier
         {:git/url "https://github.com/kotoba-lang/kotoba-verifier.git"
-         :git/sha "83057552f03a8021c6523e8e38ad7439b1953522"}}
+         ;; Advanced 2026-09-11, 83057552 -> 85ea11d6 (kotoba-verifier main,
+         ;; forward only: 126 ahead, 0 behind). `signing/verify` at this sha
+         ;; compares integers with `guest-integer?`, which is what lets a
+         ;; statement read through the kotoba reader (bigint on Node) verify.
+         :git/sha "85ea11d61cc3613bfb5ac80a7736de7ae1382942"}}
  :aliases {:test {:extra-paths ["test"]
                   :extra-deps {io.github.cognitect-labs/test-runner
                                {:git/url "https://github.com/cognitect-labs/test-runner.git"

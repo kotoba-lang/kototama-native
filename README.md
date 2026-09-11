@@ -83,5 +83,5 @@ checkable from outside. Do not merge this tree back into kototama core.
 ## Test
 
 ```bash
-clojure -M:test
+kbb -M:test
 ```

@@ -12,6 +12,9 @@
 
   Exit 0 only when every assertion passed and at least one ran."
   (:require [cljs.test :refer [deftest is testing run-tests] :as t]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as node-path]
             [kototama.native.executor :as executor]))
 
 (def i64-min (js/BigInt "-9223372036854775808"))
@@ -164,6 +167,25 @@
   (let [allowed @#'executor/allowed-capabilities]
     (is (= "" (allowed {:allow #{}})))
     (is (= "3,35" (allowed {:allow #{[:cap/call (js/BigInt 35)] [:cap/call 3] [:cap/other 1]}})))))
+
+(deftest toolchain-executables-are-found-through-symlinks
+  ;; Ubuntu's `/usr/bin/cc` is a symlink into /etc/alternatives. A PATH walk
+  ;; that lstat'd found no compiler there (2026-09-11).
+  (let [resolve @#'executor/resolve-executable
+        dir (.mkdtempSync fs (.join node-path (.tmpdir os) "kn-exec-test-"))
+        real (.join node-path dir "real-cc")
+        link (.join node-path dir "cc")
+        saved (aget (.-env js/process) "PATH")]
+    (try
+      (.writeFileSync fs real "#!/bin/sh\nexit 0\n" #js {:mode 448})
+      (.symlinkSync fs real link)
+      (aset (.-env js/process) "PATH" dir)
+      (is (= (.realpathSync fs real) (resolve "cc"))
+          "a symlinked executable resolves to its real path")
+      (is (thrown-with-msg? ExceptionInfo #"was not found" (resolve "no-such-tool")))
+      (finally
+        (aset (.-env js/process) "PATH" saved)
+        (.rmSync fs dir #js {:recursive true :force true})))))
 
 (defmethod t/report [:cljs.test/default :end-run-tests] [m]
   (let [ran (+ (:pass m) (:fail m) (:error m))]

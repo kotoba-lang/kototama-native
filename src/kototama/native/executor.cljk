@@ -1,71 +1,168 @@
 (ns kototama.native.executor
+  "The native executor: builds and measures the reviewed kexe loader, stages a
+  verified signed artifact, runs one export of it under the supervisor and
+  returns the evidence.
+
+  PORTABLE SINCE 2026-09-11 (amu ADR 0347 / 0348: the JVM route is removed
+  and `run` / `measure-runtime` were the last two commands with no Node
+  host). Every host-specific step -- process spawning, file digests, the
+  toolchain PATH walk, temp directories, UTF-8 -- has a `:cljs` branch on
+  `node:child_process` / `node:fs` / `node:crypto` / `node:os` beside the
+  original `:clj` one; the decisions (what a valid supervisor report is, how
+  a host value is marshalled, what a session re-checks per call) are shared
+  text. Where the two hosts genuinely differ the difference is named at the
+  site: `spawnSync` kills the direct child on timeout where the JVM killed
+  the process TREE (the loader spawns nothing, so the tree is one process),
+  and integers read back from the loader's report are widened to bigint
+  where a double would lose them.
+
+  Integer representation on Node: an argument or a report field may arrive
+  as a JavaScript number or a bigint. `signed-i64?` admits both within
+  [-2^63, 2^63-1]; tokens are printed with `str`, which prints a bigint as
+  its digits."
   (:require [clojure.edn :as edn]
-            [clojure.java.io :as io]
             [kotoba.lang.text :as str]
             [kotoba.kir.admission :as admission]
             [kotoba.artifact.core :as artifact]
             [kotoba.artifact.runtime-identity :as runtime-identity]
             [kotoba.verifier.signing :as signing]
-            [kotoba.kir.target :as target-profile])
-  (:import [java.nio ByteBuffer]
-           [java.nio.file Files LinkOption Path Paths]
-           [java.lang ProcessHandle]
-           [java.nio.charset CodingErrorAction StandardCharsets]
-           [java.nio.file.attribute FileAttribute]
-           [java.io ByteArrayOutputStream]
-           [java.security MessageDigest]
-           [java.util.concurrent TimeUnit]))
+            [kotoba.kir.target :as target-profile]
+            #?@(:clj [[clojure.java.io :as io]]
+                :cljs [["node:child_process" :as child]
+                       ["node:crypto" :as crypto]
+                       ["node:fs" :as fs]
+                       ["node:os" :as os]
+                       ["node:path" :as node-path]]))
+  #?(:clj (:import [java.nio ByteBuffer]
+                   [java.nio.file Files LinkOption Path Paths]
+                   [java.lang ProcessHandle]
+                   [java.nio.charset CodingErrorAction StandardCharsets]
+                   [java.nio.file.attribute FileAttribute]
+                   [java.io ByteArrayOutputStream]
+                   [java.security MessageDigest]
+                   [java.util.concurrent TimeUnit])))
 
 (def loader-source-sha256 runtime-identity/loader-source-sha256)
 (def windows-loader-source-sha256 runtime-identity/windows-loader-source-sha256)
 
-(defn- windows-host? [] (= :windows (let [os (str/lower (System/getProperty "os.name"))]
-                                      (when (str/includes? os "win") :windows))))
+;; ── integers across the two hosts ───────────────────────────────────────
+
+#?(:cljs (def ^:private i64-min (js/BigInt "-9223372036854775808")))
+#?(:cljs (def ^:private i64-max (js/BigInt "9223372036854775807")))
+
+(defn- bigint? [value]
+  #?(:clj false
+     :cljs (identical? js/BigInt (type value))))
+
+(defn- signed-i64? [value]
+  #?(:clj (and (integer? value) (<= Long/MIN_VALUE value Long/MAX_VALUE))
+     :cljs (or (and (number? value) (js/Number.isSafeInteger value))
+               (and (bigint? value) (<= i64-min value i64-max)))))
+
+(defn- host-int?
+  "An integer of either representation. Range is the caller's question."
+  [value]
+  #?(:clj (integer? value)
+     :cljs (or (and (number? value) (js/Number.isInteger value)) (bigint? value))))
+
+(defn- host-number
+  "A small integer as a host number, for arithmetic and `case`."
+  [value]
+  #?(:clj value
+     :cljs (if (bigint? value) (js/Number value) value)))
+
+;; ── host ────────────────────────────────────────────────────────────────
+
+(defn- os-name []
+  #?(:clj (str/lower (System/getProperty "os.name"))
+     :cljs (case (.-platform js/process)
+             "linux" "linux" "darwin" "mac os" "win32" "windows"
+             (.-platform js/process))))
+
+(defn- windows-host? [] (str/includes? (os-name) "win"))
+
+(defn- getenv [name]
+  #?(:clj (System/getenv name)
+     :cljs (aget (.-env js/process) name)))
 
 (defn- raw-sha256 [bytes]
-  (let [digest (.digest (MessageDigest/getInstance "SHA-256") bytes)]
-    (apply str (map #(format "%02x" (bit-and (int %) 0xff)) digest))))
+  #?(:clj (let [digest (.digest (MessageDigest/getInstance "SHA-256") bytes)]
+            (apply str (map #(format "%02x" (bit-and (int %) 0xff)) digest)))
+     :cljs (-> (.createHash crypto "sha256") (.update bytes) (.digest "hex"))))
 
 (defn- file-sha256 [file]
-  (raw-sha256 (Files/readAllBytes (.toPath ^java.io.File file))))
+  #?(:clj (raw-sha256 (Files/readAllBytes (.toPath ^java.io.File file)))
+     :cljs (raw-sha256 (.readFileSync fs (str file)))))
+
+(defn- utf8-bytes [^String s]
+  #?(:clj (.getBytes s StandardCharsets/UTF_8)
+     :cljs (js/Buffer.from s "utf8")))
+
+(defn- byte-length [bytes]
+  #?(:clj (alength ^bytes bytes)
+     :cljs (.-length bytes)))
+
+#?(:cljs
+   (defn- regular-file? [p]
+     (try (let [stat (.lstatSync fs p)] (.isFile stat)) (catch :default _ false))))
+
+#?(:cljs
+   (defn- executable-file? [p]
+     (and (regular-file? p)
+          (try (.accessSync fs p (.-X_OK (.-constants fs))) true (catch :default _ false)))))
+
+#?(:cljs
+   (defn- real-path [p] (.realpathSync fs p)))
+
+(defn- path-separator []
+  #?(:clj java.io.File/pathSeparator
+     :cljs (.-delimiter node-path)))
 
 (defn- resolve-executable [name]
   (when-not (and (string? name) (seq name) (not (str/includes? name "/"))
                  (not (str/includes? name "\\")))
     (throw (ex-info "invalid toolchain executable name" {:phase :execute})))
-  (let [path (or (System/getenv "PATH") "")
+  (let [path (or (getenv "PATH") "")
         suffixes (if (windows-host?) ["" ".exe" ".cmd" ".bat"] [""])
-        candidates (for [entry (str/split path
-                                          (re-pattern (java.util.regex.Pattern/quote
-                                                       java.io.File/pathSeparator)) -1)
-                         suffix suffixes]
-                     (.resolve (if (empty? entry)
-                                 (.toAbsolutePath (Paths/get "." (make-array String 0)))
-                                 (.toAbsolutePath (Paths/get entry (make-array String 0))))
-                               (str name suffix)))
-        candidate (first (filter #(and (Files/isRegularFile % (make-array LinkOption 0))
-                                       (Files/isExecutable %))
-                                 candidates))]
-    (when-not candidate
-      (throw (ex-info "required toolchain executable was not found"
-                      {:phase :execute})))
-    (.toRealPath ^Path candidate (make-array LinkOption 0))))
+        entries (str/split path (re-pattern (str "\\" (path-separator))) -1)]
+    #?(:clj
+       (let [candidates (for [entry entries suffix suffixes]
+                          (.resolve (if (empty? entry)
+                                      (.toAbsolutePath (Paths/get "." (make-array String 0)))
+                                      (.toAbsolutePath (Paths/get entry (make-array String 0))))
+                                    (str name suffix)))
+             candidate (first (filter #(and (Files/isRegularFile % (make-array LinkOption 0))
+                                            (Files/isExecutable %))
+                                      candidates))]
+         (when-not candidate
+           (throw (ex-info "required toolchain executable was not found"
+                           {:phase :execute})))
+         (.toRealPath ^Path candidate (make-array LinkOption 0)))
+       :cljs
+       (let [candidates (for [entry entries suffix suffixes]
+                          (.resolve node-path (if (empty? entry) "." entry) (str name suffix)))
+             candidate (first (filter executable-file? candidates))]
+         (when-not candidate
+           (throw (ex-info "required toolchain executable was not found"
+                           {:phase :execute})))
+         (real-path candidate)))))
 
 (defn- host-target []
-  (let [os (str/lower (System/getProperty "os.name"))
-        arch (str/lower (System/getProperty "os.arch"))]
+  (let [os (os-name)
+        arch #?(:clj (str/lower (System/getProperty "os.arch"))
+                :cljs (.-arch js/process))]
     (when-not (or (str/includes? os "linux") (str/includes? os "mac")
                   (str/includes? os "win"))
       (throw (ex-info "native execution is unsupported on this OS"
                       {:phase :execute :os os})))
     (cond
-      (contains? #{"amd64" "x86_64"} arch) :x86_64-kotoba-v1
+      (contains? #{"amd64" "x86_64" "x64"} arch) :x86_64-kotoba-v1
       (contains? #{"aarch64" "arm64"} arch) :aarch64-kotoba-v1
       :else (throw (ex-info "native execution is unsupported on this architecture"
                             {:phase :execute :arch arch})))))
 
 (defn- host-os []
-  (let [os (str/lower (System/getProperty "os.name"))]
+  (let [os (os-name)]
     (cond
       (str/includes? os "linux") :linux
       (str/includes? os "mac") :macos
@@ -92,72 +189,126 @@
 
 (def ^:private max-process-output-bytes (* 1024 1024))
 
-(defn- terminate-process-tree! [^Process process]
-  (let [handle (.toHandle process)]
-    (with-open [descendants (.descendants handle)]
-      (doseq [child (reverse (iterator-seq (.iterator descendants)))]
-        (.destroyForcibly ^ProcessHandle child)))
-    (.destroyForcibly handle)))
+;; ── processes ───────────────────────────────────────────────────────────
 
-(defn- read-bounded [stream limit overflow!]
-  (with-open [input stream
-              output (ByteArrayOutputStream.)]
-    (let [buffer (byte-array 8192)]
-      (loop [total 0]
-        (let [read (.read input buffer)]
-          (cond
-            (neg? read) (.toString output "UTF-8")
-            (> (+ total read) limit)
-            (do (overflow!) (.toString output "UTF-8"))
-            :else
-            (do (.write output buffer 0 read)
-                (recur (+ total read)))))))))
+#?(:clj
+   (defn- terminate-process-tree! [^Process process]
+     (let [handle (.toHandle process)]
+       (with-open [descendants (.descendants handle)]
+         (doseq [child (reverse (iterator-seq (.iterator descendants)))]
+           (.destroyForcibly ^ProcessHandle child)))
+       (.destroyForcibly handle))))
 
-(defn- run-process [command env {:keys [timeout-ms output-limit]
-                                 :or {timeout-ms 5000
-                                      output-limit max-process-output-bytes}}]
-  (let [builder (ProcessBuilder. ^java.util.List (mapv str command))
-        process-env (.environment builder)
-        _ (.clear process-env)
-        _ (.putAll process-env env)
-        process (.start builder)
-        stdout (atom nil)
-        stderr (atom nil)
-        output-exceeded? (atom false)
-        overflow! #(when (compare-and-set! output-exceeded? false true)
-                     (terminate-process-tree! process))
-        stdout-reader (doto (Thread. #(reset! stdout
-                                               (read-bounded (.getInputStream process)
-                                                             output-limit overflow!)))
-                        (.setDaemon true) (.start))
-        stderr-reader (doto (Thread. #(reset! stderr
-                                               (read-bounded (.getErrorStream process)
-                                                             output-limit overflow!)))
-                        (.setDaemon true) (.start))
-        completed? (.waitFor process timeout-ms TimeUnit/MILLISECONDS)
-        _ (when-not completed? (terminate-process-tree! process))
-        _ (.waitFor process)
-        exit (.exitValue process)]
-    (.join stdout-reader)
-    (.join stderr-reader)
-    {:exit exit :stdout @stdout :stderr @stderr
-     :timed-out? (not completed?) :output-exceeded? @output-exceeded?}))
+#?(:clj
+   (defn- read-bounded [stream limit overflow!]
+     (with-open [input stream
+                 output (ByteArrayOutputStream.)]
+       (let [buffer (byte-array 8192)]
+         (loop [total 0]
+           (let [read (.read input buffer)]
+             (cond
+               (neg? read) (.toString output "UTF-8")
+               (> (+ total read) limit)
+               (do (overflow!) (.toString output "UTF-8"))
+               :else
+               (do (.write output buffer 0 read)
+                   (recur (+ total read))))))))))
 
-(defn- toolchain-environment [^Path compiler-path]
-  (let [system-root (System/getenv "SystemRoot")
+(defn- run-process
+  "Run COMMAND with exactly ENV, bounded in time and in output. Returns
+  {:exit :stdout :stderr :timed-out? :output-exceeded?}.
+
+  On Node this is `spawnSync` with `timeout` and `maxBuffer`: a timeout or an
+  overflow kills the child with SIGKILL and is reported as ETIMEDOUT /
+  ENOBUFS on the result's `error`. The JVM branch killed the whole process
+  tree; the loader spawns no children, so on this executor the two are the
+  same process. A killed child has no exit status -- it is reported as
+  128 + the signal number, the convention a shell uses, so a caller that
+  compares `:exit` against the loader's own `:exit` field sees a mismatch
+  rather than a nil."
+  [command env {:keys [timeout-ms output-limit]
+                :or {timeout-ms 5000
+                     output-limit max-process-output-bytes}}]
+  #?(:clj
+     (let [builder (ProcessBuilder. ^java.util.List (mapv str command))
+           process-env (.environment builder)
+           _ (.clear process-env)
+           _ (.putAll process-env env)
+           process (.start builder)
+           stdout (atom nil)
+           stderr (atom nil)
+           output-exceeded? (atom false)
+           overflow! #(when (compare-and-set! output-exceeded? false true)
+                        (terminate-process-tree! process))
+           stdout-reader (doto (Thread. #(reset! stdout
+                                                  (read-bounded (.getInputStream process)
+                                                                output-limit overflow!)))
+                           (.setDaemon true) (.start))
+           stderr-reader (doto (Thread. #(reset! stderr
+                                                  (read-bounded (.getErrorStream process)
+                                                                output-limit overflow!)))
+                           (.setDaemon true) (.start))
+           completed? (.waitFor process timeout-ms TimeUnit/MILLISECONDS)
+           _ (when-not completed? (terminate-process-tree! process))
+           _ (.waitFor process)
+           exit (.exitValue process)]
+       (.join stdout-reader)
+       (.join stderr-reader)
+       {:exit exit :stdout @stdout :stderr @stderr
+        :timed-out? (not completed?) :output-exceeded? @output-exceeded?})
+     :cljs
+     (let [[program & args] (mapv str command)
+           result (.spawnSync child program (clj->js (vec args))
+                              (clj->js {:env env :encoding "utf8"
+                                        :timeout timeout-ms
+                                        :maxBuffer output-limit
+                                        :killSignal "SIGKILL"
+                                        :windowsHide true}))
+           error (.-error result)
+           code (when error (.-code error))
+           timed-out? (= "ETIMEDOUT" code)
+           exceeded? (= "ENOBUFS" code)]
+       (when (and error (not timed-out?) (not exceeded?))
+         (throw (ex-info "native process could not be started"
+                         {:phase :execute :program program :error (str (.-message error))})))
+       (let [signal (.-signal result)
+             signal-number (case signal "SIGKILL" 9 "SIGTERM" 15 "SIGABRT" 6
+                                 "SIGSEGV" 11 "SIGILL" 4 "SIGTRAP" 5 "SIGBUS" 10
+                                 "SIGFPE" 8 nil)
+             exit (cond
+                    (some? (.-status result)) (.-status result)
+                    signal-number (+ 128 signal-number)
+                    :else 70)]
+         {:exit exit
+          :stdout (or (.-stdout result) "")
+          :stderr (or (.-stderr result) "")
+          :timed-out? timed-out?
+          :output-exceeded? exceeded?}))))
+
+;; ── the toolchain ───────────────────────────────────────────────────────
+
+(defn- parent-directory [p]
+  #?(:clj (str (.getParent ^Path p))
+     :cljs (.dirname node-path (str p))))
+
+(defn- toolchain-environment [compiler-path]
+  (let [system-root (getenv "SystemRoot")
         injection-vars #{"CFLAGS" "CPPFLAGS" "LDFLAGS" "CL" "_CL_" "LINK"
                          "CPATH" "C_INCLUDE_PATH" "CPLUS_INCLUDE_PATH"
                          "OBJC_INCLUDE_PATH" "LIBRARY_PATH" "COMPILER_PATH"
                          "GCC_EXEC_PREFIX"}
+        all-env #?(:clj (into {} (System/getenv))
+                   :cljs (into {} (map (fn [k] [k (aget (.-env js/process) k)]))
+                               (js/Object.keys (.-env js/process))))
         host-env (when (windows-host?)
                    (into {}
                          (remove (fn [[name _]]
                                    (contains? injection-vars (str/upper name))))
-                         (System/getenv)))
+                         all-env))
         windows-vars (when (windows-host?)
                        (into {}
                              (keep (fn [name]
-                                     (when-let [value (System/getenv name)]
+                                     (when-let [value (getenv name)]
                                        [name value])))
                              ["INCLUDE" "LIB" "LIBPATH"
                               "ProgramFiles" "ProgramFiles(x86)" "ProgramW6432"
@@ -167,51 +318,66 @@
                               "TEMP" "TMP"]))]
     (cond->
      (merge host-env
-      {"PATH" (if (windows-host?)
-                (str (.getParent compiler-path) java.io.File/pathSeparator
-                     system-root "\\System32" java.io.File/pathSeparator
-                     (System/getenv "PATH"))
-                (str (.getParent compiler-path) java.io.File/pathSeparator
-                     "/usr/bin" java.io.File/pathSeparator "/bin"))
-       "LANG" "C"
-       "LC_ALL" "C"
-       "TZ" "UTC"
-       "SOURCE_DATE_EPOCH" "0"
-       "ZERO_AR_DATE" "1"}
-      windows-vars)
+            {"PATH" (if (windows-host?)
+                      (str (parent-directory compiler-path) (path-separator)
+                           system-root "\\System32" (path-separator)
+                           (getenv "PATH"))
+                      (str (parent-directory compiler-path) (path-separator)
+                           "/usr/bin" (path-separator) "/bin"))
+             "LANG" "C"
+             "LC_ALL" "C"
+             "TZ" "UTC"
+             "SOURCE_DATE_EPOCH" "0"
+             "ZERO_AR_DATE" "1"}
+            windows-vars)
       system-root (assoc "SystemRoot" system-root))))
 
 (defn- resolve-reported-tool [reported env]
-  (try
-    (let [lines (str/split-lines reported)
-          value (str/trim reported)]
-      (when-not (and (= 1 (count lines)) (seq value) (<= (count value) 4096))
-        (throw (ex-info "compiler reported a malformed tool path" {:phase :execute})))
-      (let [candidate (Paths/get value (make-array String 0))
-            resolved (cond
-                       (.isAbsolute candidate) candidate
-                       (not (str/includes? value "/"))
-                       (some (fn [entry]
-                               (let [path (.resolve
-                                           (.toAbsolutePath
-                                            (Paths/get entry (make-array String 0)))
-                                           value)]
-                                 (when (and (Files/isRegularFile path (make-array LinkOption 0))
-                                            (Files/isExecutable path)) path)))
-                             (str/split (get env "PATH" "")
-                                        (re-pattern (java.util.regex.Pattern/quote
-                                                     java.io.File/pathSeparator)) -1))
-                       :else nil)]
-        (when-not (and resolved
-                       (Files/isRegularFile resolved (make-array LinkOption 0))
-                       (Files/isExecutable resolved))
-          (throw (ex-info "compiler-reported tool is not an executable file"
-                          {:phase :execute})))
-        (.toRealPath ^Path resolved (make-array LinkOption 0))))
-    (catch clojure.lang.ExceptionInfo error (throw error))
-    (catch Exception error
-      (throw (ex-info "compiler reported a malformed tool path"
-                      {:phase :execute} error)))))
+  (let [lines (str/split-lines reported)
+        value (str/trim reported)]
+    (when-not (and (= 1 (count lines)) (seq value) (<= (count value) 4096))
+      (throw (ex-info "compiler reported a malformed tool path" {:phase :execute})))
+    #?(:clj
+       (try
+         (let [candidate (Paths/get value (make-array String 0))
+               resolved (cond
+                          (.isAbsolute candidate) candidate
+                          (not (str/includes? value "/"))
+                          (some (fn [entry]
+                                  (let [path (.resolve
+                                              (.toAbsolutePath
+                                               (Paths/get entry (make-array String 0)))
+                                              value)]
+                                    (when (and (Files/isRegularFile path (make-array LinkOption 0))
+                                               (Files/isExecutable path)) path)))
+                                (str/split (get env "PATH" "")
+                                           (re-pattern (java.util.regex.Pattern/quote
+                                                        java.io.File/pathSeparator)) -1))
+                          :else nil)]
+           (when-not (and resolved
+                          (Files/isRegularFile resolved (make-array LinkOption 0))
+                          (Files/isExecutable resolved))
+             (throw (ex-info "compiler-reported tool is not an executable file"
+                             {:phase :execute})))
+           (.toRealPath ^Path resolved (make-array LinkOption 0)))
+         (catch clojure.lang.ExceptionInfo error (throw error))
+         (catch Exception error
+           (throw (ex-info "compiler reported a malformed tool path"
+                           {:phase :execute} error))))
+       :cljs
+       (let [resolved (cond
+                        (.isAbsolute node-path value) value
+                        (not (str/includes? value "/"))
+                        (some (fn [entry]
+                                (let [path (.resolve node-path entry value)]
+                                  (when (executable-file? path) path)))
+                              (str/split (get env "PATH" "")
+                                         (re-pattern (str "\\" (path-separator))) -1))
+                        :else nil)]
+         (when-not (and resolved (executable-file? resolved))
+           (throw (ex-info "compiler-reported tool is not an executable file"
+                           {:phase :execute})))
+         (real-path resolved)))))
 
 (defn- compiler-tool [compiler-path name env]
   (let [query (run-process [(str compiler-path) (str "-print-prog-name=" name)]
@@ -234,157 +400,253 @@
                    (= 1 (count (str/split-lines (:stdout query))))
                    (seq value) (<= (count value) 4096))
       (throw (ex-info "native compiler resource query failed" {:phase :execute})))
-    (try
-      (let [path (Paths/get value (make-array String 0))]
-        (when-not (and (.isAbsolute path)
-                       (Files/isDirectory path (make-array LinkOption 0)))
-          (throw (ex-info "compiler resource directory is not absolute"
-                          {:phase :execute})))
-        (.toRealPath path (make-array LinkOption 0)))
-      (catch clojure.lang.ExceptionInfo error (throw error))
-      (catch Exception error
-        (throw (ex-info "compiler reported a malformed resource directory"
-                        {:phase :execute} error))))))
+    #?(:clj
+       (try
+         (let [path (Paths/get value (make-array String 0))]
+           (when-not (and (.isAbsolute path)
+                          (Files/isDirectory path (make-array LinkOption 0)))
+             (throw (ex-info "compiler resource directory is not absolute"
+                             {:phase :execute})))
+           (.toRealPath path (make-array LinkOption 0)))
+         (catch clojure.lang.ExceptionInfo error (throw error))
+         (catch Exception error
+           (throw (ex-info "compiler reported a malformed resource directory"
+                           {:phase :execute} error))))
+       :cljs
+       (let [directory? (try (.isDirectory (.lstatSync fs value)) (catch :default _ false))]
+         (when-not (and (.isAbsolute node-path value) directory?)
+           (throw (ex-info "compiler resource directory is not absolute"
+                           {:phase :execute})))
+         (real-path value)))))
 
-(defn- directory-manifest-sha256 [^Path root]
-  (with-open [stream (Files/walk root (make-array java.nio.file.FileVisitOption 0))]
-    (let [iterator (.iterator stream)
-          paths (loop [out []]
-                  (if (.hasNext iterator)
-                    (do
-                      (when (>= (count out) 20000)
-                        (throw (ex-info "compiler resource entry count exceeds limit"
-                                        {:phase :execute :limit 20000})))
-                      (recur (conj out (.next iterator))))
-                    out))]
-      (doseq [path paths]
-        (when (Files/isSymbolicLink path)
-          (throw (ex-info "compiler resource directory contains a symlink"
-                          {:phase :execute})))
-        (when-not (or (Files/isDirectory path (make-array LinkOption 0))
-                      (Files/isRegularFile path (make-array LinkOption 0)))
-          (throw (ex-info "compiler resource directory contains a special file"
-                          {:phase :execute}))))
-      (let [files (vec (filter #(Files/isRegularFile % (make-array LinkOption 0)) paths))
-            _ (when (> (count files) 10000)
-                (throw (ex-info "compiler resource file count exceeds limit"
-                                {:phase :execute :limit 10000})))
-            total (reduce + 0 (map #(Files/size ^Path %) files))
-            _ (when (> total (* 64 1024 1024))
-                (throw (ex-info "compiler resource bytes exceed limit"
-                                {:phase :execute :limit (* 64 1024 1024)})))
-            entries (mapv (fn [^Path path]
-                            (let [relative (str/replace (str (.relativize root path)) "\\" "/")
-                                  size (Files/size path)]
-                              (when (> (count relative) 4096)
-                                (throw (ex-info "compiler resource path exceeds limit"
-                                                {:phase :execute :limit 4096})))
-                              [relative size (file-sha256 (.toFile path))]))
-                          (sort-by #(str (.relativize root ^Path %)) files))]
-        (artifact/sha256 {:format :kotoba.directory-manifest/v1
-                          :files entries :total-bytes total})))))
+#?(:cljs
+   (defn- walk-tree
+     "Every path under ROOT, depth-first, ROOT included -- lstat'd, never
+     followed. The same refusals `Files/walk` produced on the JVM."
+     [root]
+     (let [out (atom [])]
+       (letfn [(visit [p]
+                 (when (>= (count @out) 20000)
+                   (throw (ex-info "compiler resource entry count exceeds limit"
+                                   {:phase :execute :limit 20000})))
+                 (let [stat (.lstatSync fs p)]
+                   (swap! out conj [p stat])
+                   (when (.isDirectory stat)
+                     (doseq [name (sort (vec (.readdirSync fs p)))]
+                       (visit (.join node-path p name))))))]
+         (visit root))
+       @out)))
 
-(defn- parse-dependency-file [text]
+(defn- directory-manifest-sha256 [root]
+  #?(:clj
+     (with-open [stream (Files/walk root (make-array java.nio.file.FileVisitOption 0))]
+       (let [iterator (.iterator stream)
+             paths (loop [out []]
+                     (if (.hasNext iterator)
+                       (do
+                         (when (>= (count out) 20000)
+                           (throw (ex-info "compiler resource entry count exceeds limit"
+                                           {:phase :execute :limit 20000})))
+                         (recur (conj out (.next iterator))))
+                       out))]
+         (doseq [path paths]
+           (when (Files/isSymbolicLink path)
+             (throw (ex-info "compiler resource directory contains a symlink"
+                             {:phase :execute})))
+           (when-not (or (Files/isDirectory path (make-array LinkOption 0))
+                         (Files/isRegularFile path (make-array LinkOption 0)))
+             (throw (ex-info "compiler resource directory contains a special file"
+                             {:phase :execute}))))
+         (let [files (vec (filter #(Files/isRegularFile % (make-array LinkOption 0)) paths))
+               _ (when (> (count files) 10000)
+                   (throw (ex-info "compiler resource file count exceeds limit"
+                                   {:phase :execute :limit 10000})))
+               total (reduce + 0 (map #(Files/size ^Path %) files))
+               _ (when (> total (* 64 1024 1024))
+                   (throw (ex-info "compiler resource bytes exceed limit"
+                                   {:phase :execute :limit (* 64 1024 1024)})))
+               entries (mapv (fn [^Path path]
+                               (let [relative (str/replace (str (.relativize root path)) "\\" "/")
+                                     size (Files/size path)]
+                                 (when (> (count relative) 4096)
+                                   (throw (ex-info "compiler resource path exceeds limit"
+                                                   {:phase :execute :limit 4096})))
+                                 [relative size (file-sha256 (.toFile path))]))
+                             (sort-by #(str (.relativize root ^Path %)) files))]
+           (artifact/sha256 {:format :kotoba.directory-manifest/v1
+                             :files entries :total-bytes total}))))
+     :cljs
+     (let [paths (walk-tree root)]
+       (doseq [[p stat] paths]
+         (when (.isSymbolicLink stat)
+           (throw (ex-info "compiler resource directory contains a symlink"
+                           {:phase :execute})))
+         (when-not (or (.isDirectory stat) (.isFile stat))
+           (throw (ex-info "compiler resource directory contains a special file"
+                           {:phase :execute}))))
+       (let [files (vec (filter (fn [[_ stat]] (.isFile stat)) paths))
+             _ (when (> (count files) 10000)
+                 (throw (ex-info "compiler resource file count exceeds limit"
+                                 {:phase :execute :limit 10000})))
+             total (reduce + 0 (map (fn [[_ stat]] (.-size stat)) files))
+             _ (when (> total (* 64 1024 1024))
+                 (throw (ex-info "compiler resource bytes exceed limit"
+                                 {:phase :execute :limit (* 64 1024 1024)})))
+             relative (fn [p] (str/replace (.relative node-path root p) "\\" "/"))
+             entries (mapv (fn [[p stat]]
+                             (let [rel (relative p)]
+                               (when (> (count rel) 4096)
+                                 (throw (ex-info "compiler resource path exceeds limit"
+                                                 {:phase :execute :limit 4096})))
+                               [rel (.-size stat) (file-sha256 p)]))
+                           (sort-by (fn [[p _]] (relative p)) files))]
+         (artifact/sha256 {:format :kotoba.directory-manifest/v1
+                           :files entries :total-bytes total})))))
+
+(def ^:private whitespace-chars
+  ;; As strings, not char literals: a char on this host IS a one-character
+  ;; string, and the vertical-tab literal has no reader spelling common to
+  ;; both hosts.
+  #{" " "\t" "\n" "\r" "\f" "\u000B"})
+
+(defn- whitespace? [ch]
+  (contains? whitespace-chars (str ch)))
+
+(defn- parse-dependency-file
+  "The Make-style `-MD` dependency file, as a vector of paths. Portable
+  text walk (the JVM version used a StringBuilder; this one accumulates a
+  vector of characters and behaves identically on both hosts)."
+  [text]
   (when-not (and (string? text) (<= (count text) (* 1024 1024))
-                 (not (str/includes? text (str \u0000))))
+                 (not (str/includes? text "\u0000")))
     (throw (ex-info "compiler dependency file exceeds syntax limits"
                     {:phase :execute})))
-  (let [colon (loop [index 0]
-                (if (>= index (dec (count text)))
+  (let [n (count text)
+        char-at (fn [i] (nth text i))
+        colon (loop [index 0]
+                (if (>= index (dec n))
                   -1
-                  (if (and (= \: (.charAt ^String text index))
-                           (Character/isWhitespace (.charAt ^String text (inc index))))
+                  (if (and (= \: (char-at index))
+                           (whitespace? (char-at (inc index))))
                     index
                     (recur (inc index)))))]
     (when (neg? colon)
       (throw (ex-info "compiler dependency file has no target separator"
                       {:phase :execute})))
-    (loop [index (inc colon) token (StringBuilder.) out []]
-      (when (> (count out) 10000)
-        (throw (ex-info "compiler dependency count exceeds limit"
-                        {:phase :execute :limit 10000})))
-      (if (>= index (count text))
-        (cond-> out (pos? (.length token)) (conj (str token)))
-        (let [ch (.charAt ^String text index)]
-          (cond
-            (= ch \\)
-            (if (>= (inc index) (count text))
-              (throw (ex-info "compiler dependency file ends in an escape"
-                              {:phase :execute}))
-              (let [next-ch (.charAt ^String text (inc index))]
-                (cond
-                  (= next-ch \newline)
-                  (recur (+ index 2) token out)
-
-                  (and (= next-ch \return)
-                       (< (+ index 2) (count text))
-                       (= \newline (.charAt ^String text (+ index 2))))
-                  (recur (+ index 3) token out)
-
-                  (or (Character/isWhitespace next-ch)
-                      (contains? #{\# \: \\} next-ch))
-                  (do (.append token next-ch)
-                      (when (> (.length token) 4096)
+    (let [too-long! (fn [token]
+                      (when (> (count token) 4096)
                         (throw (ex-info "compiler dependency path exceeds limit"
-                                        {:phase :execute :limit 4096})))
+                                        {:phase :execute :limit 4096}))))]
+      (loop [index (inc colon) token [] out []]
+        (when (> (count out) 10000)
+          (throw (ex-info "compiler dependency count exceeds limit"
+                          {:phase :execute :limit 10000})))
+        (if (>= index n)
+          (cond-> out (seq token) (conj (apply str token)))
+          (let [ch (char-at index)]
+            (cond
+              (= ch \\)
+              (if (>= (inc index) n)
+                (throw (ex-info "compiler dependency file ends in an escape"
+                                {:phase :execute}))
+                (let [next-ch (char-at (inc index))]
+                  (cond
+                    (= next-ch \newline)
+                    (recur (+ index 2) token out)
+
+                    (and (= next-ch \return)
+                         (< (+ index 2) n)
+                         (= \newline (char-at (+ index 2))))
+                    (recur (+ index 3) token out)
+
+                    (or (whitespace? next-ch)
+                        (contains? #{\# \: \\} next-ch))
+                    (let [token (conj token next-ch)]
+                      (too-long! token)
                       (recur (+ index 2) token out))
 
-                  :else
-                  ;; Clang emits native Windows separators without escaping
-                  ;; them.  A backslash before an ordinary path character is
-                  ;; therefore data, not Make escape syntax.
-                  (do (.append token ch)
-                      (recur (inc index) token out)))))
+                    :else
+                    ;; Clang emits native Windows separators without escaping
+                    ;; them.  A backslash before an ordinary path character is
+                    ;; therefore data, not Make escape syntax.
+                    (recur (inc index) (conj token ch) out))))
 
-            (Character/isWhitespace ch)
-            (if (zero? (.length token))
-              (recur (inc index) token out)
-              (recur (inc index) (StringBuilder.) (conj out (str token))))
+              (whitespace? ch)
+              (if (empty? token)
+                (recur (inc index) token out)
+                (recur (inc index) [] (conj out (apply str token))))
 
-            :else
-            (do (.append token ch)
-                (when (> (.length token) 4096)
-                  (throw (ex-info "compiler dependency path exceeds limit"
-                                  {:phase :execute :limit 4096})))
-                (recur (inc index) token out))))))))
+              :else
+              (let [token (conj token ch)]
+                (too-long! token)
+                (recur (inc index) token out)))))))))
 
 (defn- dependency-manifest-sha256 [dependencies]
-  (let [paths (mapv (fn [value]
-                      (try
-                        (let [path (Paths/get value (make-array String 0))
-                              absolute (if (.isAbsolute path) path (.toAbsolutePath path))]
-                          (when-not (Files/isRegularFile absolute (make-array LinkOption 0))
-                            (throw (ex-info "compiler dependency is not a regular file"
-                                            {:phase :execute})))
-                          (.toRealPath absolute (make-array LinkOption 0)))
-                        (catch clojure.lang.ExceptionInfo error (throw error))
-                        (catch Exception error
-                          (throw (ex-info "compiler dependency path is malformed"
-                                          {:phase :execute} error)))))
-                    (distinct dependencies))
+  (let [paths #?(:clj
+                 (mapv (fn [value]
+                         (try
+                           (let [path (Paths/get value (make-array String 0))
+                                 absolute (if (.isAbsolute path) path (.toAbsolutePath path))]
+                             (when-not (Files/isRegularFile absolute (make-array LinkOption 0))
+                               (throw (ex-info "compiler dependency is not a regular file"
+                                               {:phase :execute})))
+                             (.toRealPath absolute (make-array LinkOption 0)))
+                           (catch clojure.lang.ExceptionInfo error (throw error))
+                           (catch Exception error
+                             (throw (ex-info "compiler dependency path is malformed"
+                                             {:phase :execute} error)))))
+                       (distinct dependencies))
+                 :cljs
+                 (mapv (fn [value]
+                         (let [absolute (.resolve node-path value)]
+                           (when-not (regular-file? absolute)
+                             (throw (ex-info "compiler dependency is not a regular file"
+                                             {:phase :execute})))
+                           (real-path absolute)))
+                       (distinct dependencies)))
         _ (when (> (count paths) 10000)
             (throw (ex-info "compiler dependency count exceeds limit"
                             {:phase :execute :limit 10000})))
-        total (reduce + 0 (map #(Files/size ^Path %) paths))
+        size-of (fn [p] #?(:clj (Files/size ^Path p) :cljs (.-size (.statSync fs p))))
+        total (reduce + 0 (map size-of paths))
         _ (when (> total (* 64 1024 1024))
             (throw (ex-info "compiler dependency bytes exceed limit"
                             {:phase :execute :limit (* 64 1024 1024)})))
-        entries (mapv (fn [^Path path]
-                        [(str path) (Files/size path) (file-sha256 (.toFile path))])
+        entries (mapv (fn [path]
+                        [(str path) (size-of path)
+                         (file-sha256 #?(:clj (.toFile ^Path path) :cljs path))])
                       (sort-by str paths))]
     (artifact/sha256 {:format :kotoba.dependency-manifest/v1
                       :files entries :total-bytes total})))
 
 (defn- delete-tree! [file]
-  (when (.exists ^java.io.File file)
-    (doseq [child (reverse (file-seq file))] (io/delete-file child true))))
+  #?(:clj (when (.exists ^java.io.File file)
+            (doseq [child (reverse (file-seq file))] (io/delete-file child true)))
+     :cljs (.rmSync fs (str file) #js {:recursive true :force true})))
 
-(defn- allowed-capabilities [policy]
+(defn- file-exists? [file]
+  #?(:clj (.isFile ^java.io.File file)
+     :cljs (regular-file? (str file))))
+
+(defn- join-path [directory name]
+  #?(:clj (io/file directory name)
+     :cljs (.join node-path (str directory) name)))
+
+(defn- file-path [file]
+  #?(:clj (.getPath ^java.io.File file)
+     :cljs (str file)))
+
+(defn- allowed-capabilities
+  "The `:cap/call` ids a policy allows, ascending, joined for the loader's
+  argv. Ids are narrowed to host numbers before sorting: on Node a policy
+  read through the kotoba reader carries them as bigint, and `compare`
+  there refuses a bigint."
+  [policy]
   (->> (:allow policy #{})
        (keep (fn [effect]
                (when (and (vector? effect) (= :cap/call (first effect))
-                          (integer? (second effect)))
-                 (second effect))))
+                          (host-int? (second effect)))
+                 (host-number (second effect)))))
        sort
        (str/join ",")))
 
@@ -406,34 +668,43 @@
   (let [file-name (if windows? "kexe_loader_windows.c" "kexe_loader.c")
         directories (remove str/blank?
                             [source-dir
-                             (System/getenv "KOTOBA_LOADER_SOURCE_DIR")
+                             (getenv "KOTOBA_LOADER_SOURCE_DIR")
                              "tools"])
-        candidates (map #(io/file % file-name) directories)]
-    (or (first (filter #(.isFile ^java.io.File %) candidates))
+        candidates (map #(join-path % file-name) directories)]
+    (or (first (filter file-exists? candidates))
         (throw (ex-info "reviewed native loader source was not found"
                         {:phase :execute :file file-name
-                         :searched (mapv #(.getPath ^java.io.File %) candidates)
+                         :searched (mapv file-path candidates)
                          :name-it :loader-source-dir})))))
+
+(defn- file-size [file]
+  #?(:clj (.length ^java.io.File file)
+     :cljs (.-size (.statSync fs (str file)))))
+
+(defn- read-text [file]
+  #?(:clj (slurp file)
+     :cljs (.readFileSync fs (str file) "utf8")))
 
 (defn- build-runtime! [directory source-dir]
   (let [windows? (= :windows (host-os))
-        loader (io/file directory (if windows? "kexe-loader.exe" "kexe-loader"))
-        dependency-file (io/file directory "loader.d")
-        dependency-object (io/file directory "loader-deps.o")
+        loader (join-path directory (if windows? "kexe-loader.exe" "kexe-loader"))
+        dependency-file (join-path directory "loader.d")
+        dependency-object (join-path directory "loader-deps.o")
         loader-source (loader-source-file windows? source-dir)
         expected-source-sha (runtime-identity/loader-source-for-profile
                              (target-profile/profile (explicit-host-target)))
         compiler-path (resolve-executable (if windows? "clang" "cc"))
-        compiler-file (.toFile compiler-path)
+        compiler-file #?(:clj (.toFile ^Path compiler-path) :cljs compiler-path)
         compiler-binary-sha (file-sha256 compiler-file)
         toolchain-env (toolchain-environment compiler-path)
         assembler-path (if windows? compiler-path
-                            (compiler-tool compiler-path "as" toolchain-env))
+                           (compiler-tool compiler-path "as" toolchain-env))
         linker-path (if windows? (resolve-executable "lld-link")
-                          (compiler-tool compiler-path "ld" toolchain-env))
+                        (compiler-tool compiler-path "ld" toolchain-env))
         resource-path (compiler-resource-directory compiler-path toolchain-env)
-        assembler-sha (file-sha256 (.toFile assembler-path))
-        linker-sha (file-sha256 (.toFile linker-path))
+        tool-file (fn [p] #?(:clj (.toFile ^Path p) :cljs p))
+        assembler-sha (file-sha256 (tool-file assembler-path))
+        linker-sha (file-sha256 (tool-file linker-path))
         resource-sha (directory-manifest-sha256 resource-path)
         actual-source-sha (file-sha256 loader-source)]
     (when-not (= expected-source-sha actual-source-sha)
@@ -450,9 +721,9 @@
           compiler-text (str (:stdout compiler) (:stderr compiler))
           common-flags [(str compiler-path) "-std=c11" "-O2" "-Wall" "-Wextra" "-Werror"]
           dependency-command (vec (concat common-flags
-                                          ["-MD" "-MF" (.getPath dependency-file)
-                                           "-c" (.getPath loader-source)
-                                           "-o" (.getPath dependency-object)]))
+                                          ["-MD" "-MF" (file-path dependency-file)
+                                           "-c" (file-path loader-source)
+                                           "-o" (file-path dependency-object)]))
           dependency-build (run-process dependency-command toolchain-env
                                         {:timeout-ms 30000})
           _ (when-not (and (zero? (:exit dependency-build))
@@ -460,16 +731,16 @@
                            (not (:output-exceeded? dependency-build)))
               (throw (ex-info "native compiler dependency scan failed"
                               {:phase :execute :stderr (:stderr dependency-build)})))
-          _ (when (> (.length dependency-file) (* 1024 1024))
+          _ (when (> (file-size dependency-file) (* 1024 1024))
               (throw (ex-info "compiler dependency file exceeds byte limit"
                               {:phase :execute :limit (* 1024 1024)})))
-          dependencies (parse-dependency-file (slurp dependency-file))
+          dependencies (parse-dependency-file (read-text dependency-file))
           dependency-sha (dependency-manifest-sha256 dependencies)
           build-command (fn []
                           (vec (concat
                                 common-flags
                                 (deterministic-linker-flags)
-                                [(.getPath loader-source) "-o" (.getPath loader)]
+                                [(file-path loader-source) "-o" (file-path loader)]
                                 (when windows? ["-ladvapi32" "-luserenv" "-lws2_32"
                                                 "-lfwpuclnt" "-lrpcrt4"]))))
           build (run-process (build-command) toolchain-env {:timeout-ms 30000})
@@ -485,8 +756,8 @@
         (when-not (= compiler-binary-sha (file-sha256 compiler-file))
           (throw (ex-info "native C compiler changed during measurement"
                           {:phase :execute})))
-        (when-not (and (= assembler-sha (file-sha256 (.toFile assembler-path)))
-                       (= linker-sha (file-sha256 (.toFile linker-path))))
+        (when-not (and (= assembler-sha (file-sha256 (tool-file assembler-path)))
+                       (= linker-sha (file-sha256 (tool-file linker-path))))
           (throw (ex-info "native assembler or linker changed during measurement"
                           {:phase :execute})))
         (when-not (= resource-sha (directory-manifest-sha256 resource-path))
@@ -505,12 +776,19 @@
                    :loader-source-sha256 expected-source-sha
                    :loader-binary-sha256 loader-sha
                    :compiler-binary-sha256 compiler-binary-sha
-                   :compiler-version-sha256
-                   (raw-sha256 (.getBytes compiler-text StandardCharsets/UTF_8))
+                   :compiler-version-sha256 (raw-sha256 (utf8-bytes compiler-text))
                    :assembler-binary-sha256 assembler-sha
                    :linker-binary-sha256 linker-sha
                    :compiler-resource-sha256 resource-sha
                    :system-header-closure-sha256 dependency-sha}}))))
+
+(defn- temp-directory [prefix]
+  #?(:clj (.toFile (Files/createTempDirectory prefix (make-array FileAttribute 0)))
+     :cljs (.mkdtempSync fs (.join node-path (.tmpdir os) prefix))))
+
+(defn- read-bytes [file]
+  #?(:clj (Files/readAllBytes (.toPath ^java.io.File file))
+     :cljs (.readFileSync fs (str file))))
 
 (defn measure-runtime
   "Build the reviewed loader twice and return its identity and exact bytes.
@@ -520,14 +798,15 @@
   working directory are tried, in that order."
   ([] (measure-runtime {}))
   ([{:keys [loader-source-dir]}]
-  ;; Refuse unsupported hosts here, before invoking a host toolchain.
-  (host-target)
-  (let [directory (.toFile (Files/createTempDirectory
-                            "kotoba-measure-" (make-array FileAttribute 0)))]
-    (try
-      (let [{:keys [loader runtime]} (build-runtime! directory loader-source-dir)]
-        {:runtime runtime :loader-bytes (Files/readAllBytes (.toPath ^java.io.File loader))})
-      (finally (delete-tree! directory))))))
+   ;; Refuse unsupported hosts here, before invoking a host toolchain.
+   (host-target)
+   (let [directory (temp-directory "kotoba-measure-")]
+     (try
+       (let [{:keys [loader runtime]} (build-runtime! directory loader-source-dir)]
+         {:runtime runtime :loader-bytes (read-bytes loader)})
+       (finally (delete-tree! directory))))))
+
+;; ── the loader's report ─────────────────────────────────────────────────
 
 (defn- trap-value [stderr]
   (when-let [[_ value] (re-find #"(?m)^KEXE_TRAP (\{.*\})$" stderr)]
@@ -538,6 +817,38 @@
              (re-find #"(?m)^kexe-loader-windows: ([A-Za-z0-9_ ()-]+)(?:: win32=([0-9]+))?$"
                       (or stderr ""))]
     (str stage (when win32 (str "/win32=" win32)))))
+
+#?(:cljs
+   (defn- widen-i64-fields
+     "`edn/read-string` on this host reads an integer as a double, and a
+     result word past 2^53 comes back rounded. The loader prints the report
+     on one line with each i64-bearing field as bare digits, so those fields
+     are re-read from the TEXT as bigint when they do not fit a safe integer
+     -- `:result`, `:result-word`, and each of `:result-words`. Everything
+     else in the report is a count that fits."
+     [report text]
+     (let [widen (fn [s] (let [b (js/BigInt s)]
+                           (if (<= (js/BigInt js/Number.MIN_SAFE_INTEGER) b
+                                   (js/BigInt js/Number.MAX_SAFE_INTEGER))
+                             (js/Number b) b)))
+           one (fn [report key pattern]
+                 (if-let [[_ digits] (re-find pattern text)]
+                   (assoc report key (widen digits))
+                   report))
+           report (-> report
+                      (cond-> (contains? report :result)
+                        (one :result #":result (-?[0-9]+)"))
+                      (cond-> (contains? report :result-word)
+                        (one :result-word #":result-word (-?[0-9]+)")))]
+       (if-let [[_ words] (and (contains? report :result-words)
+                               (re-find #":result-words \[([-0-9 ]*)\]" text))]
+         (assoc report :result-words (mapv widen (remove str/blank? (str/split words #" "))))
+         report))))
+
+(defn- read-report [text]
+  (let [report (edn/read-string text)]
+    #?(:clj report
+       :cljs (if (map? report) (widen-i64-fields report text) report))))
 
 (defn- scalar-record-type? [type]
   (and (vector? type) (= 3 (count type)) (= :record (first type))
@@ -579,9 +890,9 @@
   ([host-os-value result-type]
    (cond->
     (if (= :windows host-os-value)
-      (if-let [system-root (or (System/getenv "SystemRoot")
-                               (System/getenv "WINDIR"))]
-        (if-let [local-app-data (System/getenv "LOCALAPPDATA")]
+      (if-let [system-root (or (getenv "SystemRoot")
+                               (getenv "WINDIR"))]
+        (if-let [local-app-data (getenv "LOCALAPPDATA")]
           {"KEXE_STRUCTURED_REPORT" "1"
            "SystemRoot" system-root
            ;; CreateProcessW uses this to materialize the per-profile
@@ -615,23 +926,26 @@
       env
       (assoc env "KEXE_CAP_RESOURCES_35" (str/join ":" (sort scopes))))))
 
+;; ── host values -> loader words ─────────────────────────────────────────
 
 (def ^:private hex-digits "0123456789abcdef")
 
 (defn- bytes->hex [bytes]
-  (let [out (StringBuilder. (* 2 (alength ^bytes bytes)))]
-    (doseq [byte bytes]
-      (let [value (bit-and (int byte) 0xff)]
-        (.append out (.charAt hex-digits (unsigned-bit-shift-right value 4)))
-        (.append out (.charAt hex-digits (bit-and value 0x0f)))))
-    (str out)))
+  #?(:clj
+     (let [out (StringBuilder. (* 2 (alength ^bytes bytes)))]
+       (doseq [byte bytes]
+         (let [value (bit-and (int byte) 0xff)]
+           (.append out (.charAt hex-digits (unsigned-bit-shift-right value 4)))
+           (.append out (.charAt hex-digits (bit-and value 0x0f)))))
+       (str out))
+     :cljs (.toString (js/Buffer.from bytes) "hex")))
 
 (defn- string-argument-token [entry index value]
   (when-not (string? value)
     (throw (ex-info "execution input does not match entry arguments (entry arity)"
                     {:phase :execute :entry entry :index index :expected :string})))
-  (let [bytes (.getBytes ^String value StandardCharsets/UTF_8)]
-    (when (> (alength bytes) 65536)
+  (let [bytes (utf8-bytes value)]
+    (when (> (byte-length bytes) 65536)
       (throw (ex-info "execution string input exceeds native host arena"
                       {:phase :execute :entry entry :index index
                        :limit-bytes 65536})))
@@ -669,25 +983,26 @@
 (defn- region-argument-token [entry index value]
   (let [bytes (:region value)]
     (when-not (and (sequential? bytes)
-                   (every? #(and (integer? %) (<= 0 % 255)) bytes))
+                   (every? #(and (host-int? %) (<= 0 % 255)) bytes))
       (throw (ex-info "execution region argument is not a sequence of bytes"
                       {:phase :execute :entry entry :index index})))
     (when (> (count bytes) region-pool-bytes)
       (throw (ex-info "execution region exceeds the native host arena"
                       {:phase :execute :entry entry :index index
                        :bytes (count bytes) :limit-bytes region-pool-bytes})))
-    (str "g:" (bytes->hex (byte-array (mapv unchecked-byte bytes))))))
+    (str "g:" (bytes->hex #?(:clj (byte-array (mapv unchecked-byte bytes))
+                             :cljs (js/Uint8Array.from (clj->js (mapv host-number bytes))))))))
 
 (defn- region-length-argument-token [entry index value]
   (let [ordinal (:region-length value)]
-    (when-not (and (integer? ordinal) (<= 0 ordinal 7))
+    (when-not (and (host-int? ordinal) (<= 0 ordinal 7))
       (throw (ex-info "execution region-length argument does not name a region"
                       {:phase :execute :entry entry :index index})))
     (str "gl:" ordinal)))
 
 (defn- scalar-host-word [entry index field-name type value]
   (case type
-    :i64 (if (and (integer? value) (<= Long/MIN_VALUE value Long/MAX_VALUE))
+    :i64 (if (signed-i64? value)
            value
            (throw (ex-info "execution input does not match record field"
                            {:phase :execute :entry entry :index index
@@ -711,9 +1026,6 @@
                           (scalar-host-word entry index field-name field-type
                                             (get value field-name)))
                         fields)))))
-
-(defn- signed-i64? [value]
-  (and (integer? value) (<= Long/MIN_VALUE value Long/MAX_VALUE)))
 
 (defn- tagged-i64-argument-token [entry index type value]
   (let [valid? (if (= type :option-i64)
@@ -760,19 +1072,25 @@
 (defn- decode-utf8-hex [value]
   (when (and (string? value) (even? (count value))
              (boolean (re-matches #"[0-9a-f]*" value)))
-    (try
-      (let [bytes (byte-array (quot (count value) 2))]
-        (dotimes [index (alength bytes)]
-          (aset-byte bytes index
-                     (unchecked-byte
-                      (Integer/parseInt (.substring ^String value
-                                                    (* 2 index) (+ (* 2 index) 2))
-                                        16))))
-        (let [decoder (doto (.newDecoder StandardCharsets/UTF_8)
-                        (.onMalformedInput CodingErrorAction/REPORT)
-                        (.onUnmappableCharacter CodingErrorAction/REPORT))]
-          (str (.decode decoder (ByteBuffer/wrap bytes)))))
-      (catch Exception _ nil))))
+    #?(:clj
+       (try
+         (let [bytes (byte-array (quot (count value) 2))]
+           (dotimes [index (alength bytes)]
+             (aset-byte bytes index
+                        (unchecked-byte
+                         (Integer/parseInt (.substring ^String value
+                                                       (* 2 index) (+ (* 2 index) 2))
+                                           16))))
+           (let [decoder (doto (.newDecoder StandardCharsets/UTF_8)
+                           (.onMalformedInput CodingErrorAction/REPORT)
+                           (.onUnmappableCharacter CodingErrorAction/REPORT))]
+             (str (.decode decoder (ByteBuffer/wrap bytes)))))
+         (catch Exception _ nil))
+       :cljs
+       (try
+         (.decode (js/TextDecoder. "utf-8" #js {:fatal true})
+                  (js/Buffer.from value "hex"))
+         (catch :default _ nil)))))
 
 (defn- valid-supervisor-report? [report exit]
   (let [status (:status report)
@@ -815,10 +1133,10 @@
          (= (zero? exit) (= status :ok))
          (= #{:initial :remaining} (set (keys fuel)))
          (= 512 (:initial fuel))
-         (integer? (:remaining fuel)) (<= 0 (:remaining fuel) 512)
+         (host-int? (:remaining fuel)) (<= 0 (:remaining fuel) 512)
          (= #{:capacity :used} (set (keys heap)))
          (= 4096 (:capacity heap))
-         (integer? (:used heap)) (<= 0 (:used heap) 4096)
+         (host-int? (:used heap)) (<= 0 (:used heap) 4096)
          ;; Structure and bounds, NOT the constant. `:fuel` and `:heap` above
          ;; pin their defaults because this executor always runs at them; the
          ;; vector arenas are a per-run budget (KEXE_VECTOR_CAPACITY /
@@ -836,25 +1154,23 @@
          ;; read -- exhaustion arrived as a bare trap beside a `:heap` line
          ;; about the pair arena, which string work does not touch.
          (= #{:capacity :used} (set (keys string-pool)))
-         (integer? (:capacity string-pool)) (pos? (:capacity string-pool))
-         (integer? (:used string-pool)) (<= 0 (:used string-pool) (:capacity string-pool))
+         (host-int? (:capacity string-pool)) (pos? (:capacity string-pool))
+         (host-int? (:used string-pool)) (<= 0 (:used string-pool) (:capacity string-pool))
          (= #{:capacity :used} (set (keys vectors)))
-         (integer? (:capacity vectors)) (pos? (:capacity vectors))
-         (integer? (:used vectors)) (<= 0 (:used vectors) (:capacity vectors))
+         (host-int? (:capacity vectors)) (pos? (:capacity vectors))
+         (host-int? (:used vectors)) (<= 0 (:used vectors) (:capacity vectors))
          (= #{:capacity :used} (set (keys vector-items)))
-         (integer? (:capacity vector-items)) (pos? (:capacity vector-items))
-         (integer? (:used vector-items))
+         (host-int? (:capacity vector-items)) (pos? (:capacity vector-items))
+         (host-int? (:used vector-items))
          (<= 0 (:used vector-items) (:capacity vector-items))
          (or (not= status :trap) (= exit (:exit report)))
-         (or (not= status :ok) (integer? (:result report)))
+         (or (not= status :ok) (host-int? (:result report)))
          (or (not string-result?)
              (some? (decode-utf8-hex (:result-utf8-hex report))))
          (or (not record-result?)
              (and (vector? (:result-words report))
                   (<= 1 (count (:result-words report)) 128)
-                  (every? #(and (integer? %)
-                                (<= Long/MIN_VALUE % Long/MAX_VALUE))
-                          (:result-words report))))
+                  (every? signed-i64? (:result-words report))))
          (or (not tagged-result?)
              (and (boolean? (:result-tag report))
                   (signed-i64? (:result-word report))
@@ -862,7 +1178,7 @@
                       (:result-tag report)
                       (zero? (:result-word report)))))
          (or (not variant-result?)
-             (and (integer? (:result-ordinal report))
+             (and (host-int? (:result-ordinal report))
                   (<= 0 (:result-ordinal report) 31)
                   (signed-i64? (:result-word report)))))))
 
@@ -908,8 +1224,7 @@
                     (region-length-argument? value)
                     (region-length-argument-token entry index value)
 
-                    (and (integer? value)
-                         (<= Long/MIN_VALUE value Long/MAX_VALUE))
+                    (signed-i64? value)
                     value
 
                     :else
@@ -968,7 +1283,7 @@
 (defn- host-result [result-type report]
   (cond
     (= :bool result-type)
-    (case (:result report)
+    (case (host-number (:result report))
       0 false
       1 true
       (throw (ex-info "native bool result is not 0/1"
@@ -982,17 +1297,17 @@
     (= :result-i64 result-type)
     [(:result-tag report) (:result-word report)]
     (scalar-variant-type? result-type)
-    (let [ordinal (:result-ordinal report)
+    (let [ordinal (host-number (:result-ordinal report))
           cases (nth result-type 2)]
-      (when-not (and (integer? ordinal) (<= 0 ordinal) (< ordinal (count cases)))
+      (when-not (and (host-int? ordinal) (<= 0 ordinal) (< ordinal (count cases)))
         (throw (ex-info "native variant result ordinal is outside descriptor"
                         {:phase :execute :ordinal ordinal :case-count (count cases)})))
       (let [[case-name payload-type] (nth cases ordinal)
             word (:result-word report)
             payload (case payload-type
                       :i64 word
-                      :bool (if (contains? #{0 1} word)
-                              (= 1 word)
+                      :bool (if (contains? #{0 1} (host-number word))
+                              (= 1 (host-number word))
                               (throw (ex-info "native variant bool payload is not 0/1"
                                               {:phase :execute :case case-name
                                                :word word}))))]
@@ -1009,8 +1324,8 @@
                    [field-name
                     (case field-type
                       :i64 word
-                      :bool (if (contains? #{0 1} word)
-                              (= 1 word)
+                      :bool (if (contains? #{0 1} (host-number word))
+                              (= 1 (host-number word))
                               (throw (ex-info "native record bool field is not 0/1"
                                               {:phase :execute :field field-name
                                                :word word}))))])
@@ -1040,6 +1355,20 @@
     (when (>= now expires)
       (throw (ex-info "signature is expired"
                       {:phase :trust :expires expires :now now})))))
+
+(defn- write-bytes! [file bytes executable?]
+  #?(:clj (do (with-open [out (io/output-stream file)]
+                (.write out ^bytes bytes))
+              (when (and executable? (not (.setExecutable ^java.io.File file true true)))
+                (throw (ex-info "cannot make measured loader executable"
+                                {:phase :execute}))))
+     :cljs (do (.writeFileSync fs (str file) bytes
+                               #js {:mode (if executable? 448 384)})
+               (when executable? (.chmodSync fs (str file) 448)))))
+
+(defn- can-execute? [file]
+  #?(:clj (.canExecute ^java.io.File file)
+     :cljs (executable-file? (str file))))
 
 (defn prepare
   "Verify a signed native artifact once and stage its measured execution
@@ -1102,26 +1431,23 @@
     (when-not (and (string? loader-path) (seq loader-path))
       (throw (ex-info "native execution requires a measured loader"
                       {:phase :execute})))
-    (let [loader-source (io/file loader-path)
-          loader-bytes (when (.isFile loader-source)
-                         (Files/readAllBytes (.toPath loader-source)))]
-      (when-not (and loader-bytes (.canExecute loader-source)
+    (let [loader-source #?(:clj (io/file loader-path) :cljs loader-path)
+          loader-bytes (when (file-exists? loader-source)
+                         (read-bytes loader-source))]
+      (when-not (and loader-bytes (can-execute? loader-source)
                      (= (:loader-binary-sha256 runtime) (raw-sha256 loader-bytes)))
         (throw (ex-info "measured native loader does not match runtime identity"
                         {:phase :runtime-identity})))
-      (let [directory (.toFile (Files/createTempDirectory
-                                "kotoba-native-" (make-array FileAttribute 0)))
-            code-file (io/file directory "program.bin")
-            loader (io/file directory (if (= :windows host-os-value)
-                                        "kexe-loader.exe" "kexe-loader"))]
+      (let [directory (temp-directory "kotoba-native-")
+            code-file (join-path directory "program.bin")
+            loader (join-path directory (if (= :windows host-os-value)
+                                          "kexe-loader.exe" "kexe-loader"))]
         (try
-          (with-open [out (io/output-stream loader)]
-            (.write out ^bytes loader-bytes))
-          (when-not (or (= :windows host-os-value) (.setExecutable loader true true))
-            (throw (ex-info "cannot make measured loader executable"
-                            {:phase :execute})))
-          (with-open [out (io/output-stream code-file)]
-            (.write out ^bytes (byte-array (map unchecked-byte (:code artifact)))))
+          (write-bytes! loader loader-bytes (not= :windows host-os-value))
+          (write-bytes! code-file
+                        #?(:clj (byte-array (map unchecked-byte (:code artifact)))
+                           :cljs (js/Uint8Array.from (clj->js (mapv host-number (:code artifact)))))
+                        false)
           {:format :kotoba.native-session/v1
            :artifact artifact
            :signer signer
@@ -1134,7 +1460,7 @@
            :directory directory
            :code-file code-file
            :loader loader}
-          (catch Throwable failure
+          (catch #?(:clj Throwable :cljs :default) failure
             (delete-tree! directory)
             (throw failure)))))))
 
@@ -1145,12 +1471,20 @@
     (delete-tree! directory))
   nil)
 
+(defn- now-seconds []
+  #?(:clj (quot (System/currentTimeMillis) 1000)
+     :cljs (quot (.now js/Date) 1000)))
+
 (defn invoke
   "Execute one export of a prepared session. Returns measured supervisor
   evidence in the same shape `execute` returns."
   [session policy input {:keys [now entry] :as opts}]
   (let [{:keys [artifact runtime host-backend host-os code-file loader]} session
-        entry (or entry 'main)
+        ;; `(if ...)`, not `(or entry 'main)`: the nbb engine this runs on
+        ;; (org-babashka-nbb a28e1901) loses the quote inside `or` / `and`
+        ;; and tries to resolve `main` as a var. Measured 2026-09-11 with
+        ;; `nbb -e "(or nil 'main)"`; `(if nil 1 'main)` is fine.
+        entry (if entry entry (symbol "main"))
         export (get (:exports artifact) entry)
         args (:args input)]
     (when-not (= :kotoba.native-session/v1 (:format session))
@@ -1163,26 +1497,26 @@
       (when-not (map? input)
         (throw (ex-info "execution input does not match entry arguments (entry arity)"
                         {:phase :execute :entry entry :arity (:arity export)})))
-      (when-not (= (:arity export) (count param-types))
+      (when-not (= (host-number (:arity export)) (count param-types))
         (throw (ex-info "native export arity disagrees with sealed KIR"
                         {:phase :execute :entry entry :export-arity (:arity export)
                          :kir-arity (count param-types)})))
       (let [args (marshal-entry-arguments entry param-types args)]
         (admit-entry-result! entry result)
-        (when-not (and (.isFile ^java.io.File code-file)
-                       (.isFile ^java.io.File loader))
+        (when-not (and (file-exists? code-file) (file-exists? loader))
           (throw (ex-info "native session is closed" {:phase :execute})))
         (let [isa (if (= host-backend :x86_64-kotoba-v1) "x86_64" "aarch64")
               allow (let [ids (allowed-capabilities policy)] (if (empty? ids) "-" ids))
-              command (into [(.getPath ^java.io.File loader) (.getPath ^java.io.File code-file)
+              command (into [(file-path loader) (file-path code-file)
                              (str (:offset export)) (str (:arity export)) isa allow]
                             (map str args))
-              started-at (quot (System/currentTimeMillis) 1000)
+              started-at (now-seconds)
               process (run-process command (fs-app-data-scope-env opts (runtime-environment host-os result))
                                    {:timeout-ms (if (= :windows host-os) 60000 5000)
                                     :output-limit (if (= :string result) 160000 65536)})
-              finished-at (quot (System/currentTimeMillis) 1000)
-              report (edn/read-string (str/trim (:stdout process)))
+              finished-at (now-seconds)
+              report (try (read-report (str/trim (:stdout process)))
+                          (catch #?(:clj Exception :cljs :default) _ nil))
               trap (trap-value (:stderr process))
               status (:status report)
               _ (when-not (valid-supervisor-report? report (:exit process))

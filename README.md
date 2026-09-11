@@ -80,8 +80,46 @@ checkable from outside. Do not merge this tree back into kototama core.
 - `kotoba-lang/artifact`
 - `kotoba-lang/kotoba-native`
 
+## Hosts
+
+`kototama.native.executor` is one namespace with a `:clj` and a `:cljs`
+branch at every host-specific site (process spawning, digests, the toolchain
+PATH walk, temp directories). Since 2026-09-11 (amu ADR 0347 / 0348) the
+host that ships is **Node**, through amu's nbb route: `amu run` and
+`amu measure-runtime` call `execute` / `measure-runtime` here. The `:clj`
+branch is the original and stays as the reference text; nothing in this
+workspace runs it any more.
+
+Two things the Node host does that the JVM host did not:
+
+- **Integers may be bigint.** An argument or a report field read through the
+  kotoba reader arrives as a JavaScript bigint; a `:result`, `:result-word`
+  or `:result-words` entry past 2^53 is re-read from the report TEXT as
+  bigint so that the value that leaves the loader is the value the caller
+  gets (`examples/i64-beyond-double.kotoba` in amu is the check).
+- **Timeouts kill the direct child, not a tree.** `spawnSync` has no process
+  tree; the loader spawns nothing, so on this executor the two are the same
+  process. A killed child reports `128 + signal`.
+
 ## Test
 
+The Node suite (66 assertions on the decisions: report validation, argument
+lowering, result boxing, the Make dependency parser, bigint handling) runs on
+the nbb engine with the executor's closure on the classpath. amu's lock is
+that closure already resolved:
+
 ```bash
-kbb -M:test
+cd <amu>
+node bin/kbb --backend sci \
+  --classpath "<kototama-native>/src:<kototama-native>/test:$(node bin/kbb --backend sci --classpath src scripts/print-classpath.cljk . | paste -sd:)" \
+  <kototama-native>/test/nbb/executor_test.cljk
 ```
+
+The executed evidence -- a loader measured twice for reproducibility, a
+signed artifact run, a receipt verified -- is amu's `scripts/conformance.cljk`
+(`attested-run`), which drives this executor through `amu measure-runtime`
+and `amu run` on the host ISA.
+
+`test/tender/native_test.cljk` is the JVM suite. `clojure -M:test` reports
+`Ran 0 tests` since the `.cljk` rename (the JVM runner does not load that
+extension); it is kept as the origin of the fixtures the Node suite mirrors.

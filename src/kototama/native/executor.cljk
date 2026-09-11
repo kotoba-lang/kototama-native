@@ -1483,7 +1483,7 @@
         ;; `(if ...)`, not `(or entry 'main)`: the nbb engine this runs on
         ;; (org-babashka-nbb a28e1901) loses the quote inside `or` / `and`
         ;; and tries to resolve `main` as a var. Measured 2026-09-11 with
-        ;; `nbb -e "(or nil 'main)"`; `(if nil 1 'main)` is fine.
+        ;; `kbb --backend sci -e "(or nil 'main)"`; `(if nil 1 'main)` is fine.
         entry (if entry entry (symbol "main"))
         export (get (:exports artifact) entry)
         args (:args input)]

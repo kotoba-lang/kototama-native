@@ -120,6 +120,6 @@ signed artifact run, a receipt verified -- is amu's `scripts/conformance.cljk`
 (`attested-run`), which drives this executor through `amu measure-runtime`
 and `amu run` on the host ISA.
 
-`test/tender/native_test.cljk` is the JVM suite. `clojure -M:test` reports
+`test/tender/native_test.cljk` is the JVM suite. `kbb -M:test` reports
 `Ran 0 tests` since the `.cljk` rename (the JVM runner does not load that
 extension); it is kept as the origin of the fixtures the Node suite mirrors.

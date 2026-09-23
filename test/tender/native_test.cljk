@@ -1,5 +1,5 @@
 (ns tender.native-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [kototama.native.executor :as executor]))
 
 ;; Load gate: the split must not break namespace resolution. Each extracted

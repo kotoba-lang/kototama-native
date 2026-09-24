@@ -187,6 +187,35 @@
         (aset (.-env js/process) "PATH" saved)
         (.rmSync fs dir #js {:recursive true :force true})))))
 
+(deftest supervision-follows-the-artifacts-fuel-profile
+  ;; P4 of adr-2609242100: an unmetered artifact (the native default) runs
+  ;; with no KEXE_FUEL and must report :metered false at the counter's
+  ;; ceiling; a metered one runs at its sealed :limits :fuel. Both directions.
+  (let [profile @#'executor/fuel-profile
+        valid? @#'executor/valid-supervisor-report?
+        arenas {:vectors {:capacity 4096 :used 0}
+                :vector-items {:capacity 65536 :used 0}
+                :string-pool {:capacity 65536 :used 0}
+                :heap {:capacity 4096 :used 3001}}
+        unmetered-profile (profile {:limits {:fuel 100000 :fuel-metering :off}} :macos)
+        metered-profile (profile {:limits {:fuel 6006}} :linux)
+        unmetered (merge arenas {:status :ok :result 500500
+                                 :fuel {:initial 9007199254740991
+                                        :remaining 9007199254734985 :metered false}})
+        metered (merge arenas {:status :ok :result 500500
+                               :fuel {:initial 6006 :remaining 0}})]
+    (is (= {:env {} :initial 9007199254740991 :metered? false} unmetered-profile))
+    (is (= {:env {"KEXE_FUEL" "6006"} :initial 6006 :metered? true} metered-profile))
+    (is (= {:env {} :initial 512 :metered? true}
+           (profile {:limits {:fuel 6006 :fuel-metering :off}} :windows))
+        "the Windows loader reads no KEXE_FUEL and runs a fixed 512")
+    (is (true? (valid? unmetered 0 unmetered-profile)))
+    (is (false? (valid? unmetered 0 metered-profile)))
+    (is (true? (valid? metered 0 metered-profile)))
+    (is (false? (valid? metered 0 unmetered-profile)))
+    (is (false? (valid? (assoc-in unmetered [:fuel :metered] true) 0 unmetered-profile)))
+    (is (false? (valid? (assoc-in metered [:fuel :remaining] 6007) 0 metered-profile)))))
+
 (defmethod t/report [:cljs.test/default :end-run-tests] [m]
   (let [ran (+ (:pass m) (:fail m) (:error m))]
     (println (str "SCANNED\t" ran " assertions, " (:fail m) " failures, " (:error m) " errors"))

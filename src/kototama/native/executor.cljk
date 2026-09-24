@@ -1100,7 +1100,47 @@
                   (js/Buffer.from value "hex"))
          (catch :default _ nil)))))
 
-(defn- valid-supervisor-report? [report exit]
+;; P4 of superproject adr-2609242100: the fuel profile a run is SUPERVISED
+;; under comes from the sealed artifact. An unmetered artifact
+;; (`:limits :fuel-metering :off`, the native profile's default) runs with no
+;; KEXE_FUEL and reports `:fuel {:initial 2^53-1 :remaining r :metered
+;; false}`; a metered one runs at its sealed `:limits :fuel` -- on POSIX
+;; through KEXE_FUEL. Before P4 this executor never passed KEXE_FUEL, so every
+;; run was metered at the loader's 512 whatever the artifact sealed, and the
+;; validator pinned 512. The Windows loader still runs a fixed 512 and reads
+;; no KEXE_FUEL, so a Windows run keeps that expectation.
+(declare valid-supervisor-report*)
+
+(def ^:private unmetered-fuel-initial 9007199254740991)
+
+(defn- fuel-profile
+  "{:env <extra environment> :initial <expected :fuel :initial> :metered? b}"
+  [artifact host-os-value]
+  (let [limits (:limits artifact)
+        fuel (:fuel limits)
+        fuel (if (and (some? fuel) (not (number? fuel))) (host-number fuel) fuel)]
+    (cond
+      (= :windows host-os-value) {:env {} :initial 512 :metered? true}
+      (= :off (:fuel-metering limits)) {:env {} :initial unmetered-fuel-initial :metered? false}
+      (integer? fuel) {:env {"KEXE_FUEL" (str fuel)} :initial fuel :metered? true}
+      :else {:env {} :initial 512 :metered? true})))
+
+(defn- valid-fuel-report? [fuel {:keys [initial metered?]}]
+  (and (map? fuel)
+       (if metered?
+         (= #{:initial :remaining} (set (keys fuel)))
+         (and (= #{:initial :remaining :metered} (set (keys fuel)))
+              (false? (:metered fuel))))
+       (= initial (:initial fuel))
+       (host-int? (:remaining fuel)) (<= 0 (:remaining fuel) initial)))
+
+(defn- valid-supervisor-report?
+  ([report exit] (valid-supervisor-report? report exit {:initial 512 :metered? true}))
+  ([report exit profile]
+   (and (valid-fuel-report? (:fuel report) profile)
+        (valid-supervisor-report* report exit))))
+
+(defn- valid-supervisor-report* [report exit]
   (let [status (:status report)
         string-result? (and (= status :ok) (= :string (:result-type report)))
         record-result? (and (= status :ok) (= :record (:result-type report)))
@@ -1139,9 +1179,7 @@
     (and (map? report)
          (= expected-keys (set (keys report)))
          (= (zero? exit) (= status :ok))
-         (= #{:initial :remaining} (set (keys fuel)))
-         (= 512 (:initial fuel))
-         (host-int? (:remaining fuel)) (<= 0 (:remaining fuel) 512)
+         ;; fuel: checked against the run's profile in `valid-fuel-report?`.
          (= #{:capacity :used} (set (keys heap)))
          (= 4096 (:capacity heap))
          (host-int? (:used heap)) (<= 0 (:used heap) 4096)
@@ -1519,7 +1557,9 @@
                              (str (:offset export)) (str (:arity export)) isa allow]
                             (map str args))
               started-at (now-seconds)
-              process (run-process command (fs-app-data-scope-env opts (runtime-environment host-os result))
+              profile (fuel-profile artifact host-os)
+              process (run-process command (merge (fs-app-data-scope-env opts (runtime-environment host-os result))
+                                                  (:env profile))
                                    {:timeout-ms (if (= :windows host-os) 60000 5000)
                                     :output-limit (if (= :string result) 160000 65536)})
               finished-at (now-seconds)
@@ -1527,7 +1567,7 @@
                           (catch #?(:clj Exception :cljs :default) _ nil))
               trap (trap-value (:stderr process))
               status (:status report)
-              _ (when-not (valid-supervisor-report? report (:exit process))
+              _ (when-not (valid-supervisor-report? report (:exit process) profile)
                   (throw (ex-info (str "malformed native supervisor evidence"
                                        " (exit=" (:exit process)
                                        ", timed-out=" (:timed-out? process)

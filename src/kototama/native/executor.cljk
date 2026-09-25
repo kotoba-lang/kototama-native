@@ -20,7 +20,7 @@
   as a JavaScript number or a bigint. `signed-i64?` admits both within
   [-2^63, 2^63-1]; tokens are printed with `str`, which prints a bigint as
   its digits."
-  (:require [clojure.edn :as edn]
+  (:require [kotoba.bytes :as kbytes] [clojure.edn :as edn]
             [kotoba.lang.text :as str]
             [kotoba.kir.admission :as admission]
             [kotoba.artifact.core :as artifact]
@@ -95,7 +95,7 @@
      :cljs (raw-sha256 (.readFileSync fs (str file)))))
 
 (defn- utf8-bytes [^String s]
-  #?(:clj (.getBytes s StandardCharsets/UTF_8)
+  #?(:clj (kbytes/utf8-bytes s)
      :cljs (js/Buffer.from s "utf8")))
 
 (defn- byte-length [bytes]

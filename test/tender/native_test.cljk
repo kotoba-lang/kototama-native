@@ -1,5 +1,5 @@
 (ns tender.native-test
-  (:require [kotoba.test :refer [deftest is testing]]
+  (:require [kotoba.lang.error :as kerror] [kotoba.test :refer [deftest is testing]]
             [kototama.native.executor :as executor]))
 
 ;; Load gate: the split must not break namespace resolution. Each extracted
@@ -95,7 +95,7 @@
            (contract artifact 'choose)))
     (is (= {:param-types [:bool] :result :bool}
            (contract artifact 'negate)))
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"no unique typed function"
+    (is (thrown-with-msg? kerror/ExceptionInfo #"no unique typed function"
                           (contract artifact 'missing)))))
 
 (deftest bool-i64-and-string-host-values-remain-distinct
@@ -103,19 +103,19 @@
     (is (= [1 41] (marshal 'choose [:bool :i64] [true 41])))
     (is (= [0 Long/MIN_VALUE]
            (marshal 'choose [:bool :i64] [false Long/MIN_VALUE])))
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"entry arguments"
+    (is (thrown-with-msg? kerror/ExceptionInfo #"entry arguments"
                           (marshal 'choose [:bool :i64] [1 41])))
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"entry arguments"
+    (is (thrown-with-msg? kerror/ExceptionInfo #"entry arguments"
                           (marshal 'choose [:bool :i64] [true true])))
     (is (= ["s:6869f09f9880"] (marshal 'echo [:string] ["hi😀"])))
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"entry arguments"
+    (is (thrown-with-msg? kerror/ExceptionInfo #"entry arguments"
                           (marshal 'echo [:string] [41])))
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"exceeds native host arena"
+    (is (thrown-with-msg? kerror/ExceptionInfo #"exceeds native host arena"
                           (marshal 'echo [:string] [(apply str (repeat 65537 "a"))])))
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"inputs exceed native host arena"
+    (is (thrown-with-msg? kerror/ExceptionInfo #"inputs exceed native host arena"
                           (marshal 'join [:string :string]
                                    (vec (repeat 2 (apply str (repeat 40000 "a")))))))
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"parameter type"
+    (is (thrown-with-msg? kerror/ExceptionInfo #"parameter type"
                           (marshal 'echo [:f64] [1.0])))))
 
 (deftest selected-export-result-is-boxed-or-refused-by-type
@@ -127,7 +127,7 @@
     (is (= 7 (host-result :i64 {:result 7})))
     (is (true? (host-result :bool {:result 1})))
     (is (false? (host-result :bool {:result 0})))
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"bool result is not 0/1"
+    (is (thrown-with-msg? kerror/ExceptionInfo #"bool result is not 0/1"
                           (host-result :bool {:result 2})))
     (is (= "hi😀" (host-result :string {:result-utf8-hex "6869f09f9880"})))
     (is (= [false]
@@ -146,15 +146,15 @@
                         {:result-ordinal 0 :result-word Long/MIN_VALUE})))
     (is (= [variant-type :ready true]
            (host-result variant-type {:result-ordinal 1 :result-word 1})))
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"ordinal is outside"
+    (is (thrown-with-msg? kerror/ExceptionInfo #"ordinal is outside"
                           (host-result variant-type
                                        {:result-ordinal 2 :result-word 0})))
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"bool payload is not 0/1"
+    (is (thrown-with-msg? kerror/ExceptionInfo #"bool payload is not 0/1"
                           (host-result variant-type
                                        {:result-ordinal 1 :result-word 2})))
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"field count mismatch"
+    (is (thrown-with-msg? kerror/ExceptionInfo #"field count mismatch"
                           (host-result record-type {:result-words [-7]})))
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"bool field is not 0/1"
+    (is (thrown-with-msg? kerror/ExceptionInfo #"bool field is not 0/1"
                           (host-result record-type {:result-words [-7 2]})))
     (is (nil? (admit! 'choose :i64)))
     (is (nil? (admit! 'negate :bool)))
@@ -163,7 +163,7 @@
     (is (nil? (admit! 'outcome :result-i64)))
     (is (nil? (admit! 'pair record-type)))
     (is (nil? (admit! 'outcome variant-type)))
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"result type"
+    (is (thrown-with-msg? kerror/ExceptionInfo #"result type"
                           (admit! 'measure :f64)))))
 
 (deftest scalar-record-host-boundary-is-declaration-ordered-and-exact
@@ -174,18 +174,18 @@
                     [{:ready true :left Long/MIN_VALUE}])))
     (is (= ["r:7,0"]
            (marshal 'echo [record-type] [{:left 7 :ready false}])))
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"record fields"
+    (is (thrown-with-msg? kerror/ExceptionInfo #"record fields"
                           (marshal 'echo [record-type] [{:left 7}])))
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"record fields"
+    (is (thrown-with-msg? kerror/ExceptionInfo #"record fields"
                           (marshal 'echo [record-type]
                                    [{:left 7 :ready true :extra 1}])))
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"record field"
+    (is (thrown-with-msg? kerror/ExceptionInfo #"record field"
                           (marshal 'echo [record-type]
                                    [{:left true :ready true}])))
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"record field"
+    (is (thrown-with-msg? kerror/ExceptionInfo #"record field"
                           (marshal 'echo [record-type]
                                    [{:left 7 :ready 1}])))
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"parameter type"
+    (is (thrown-with-msg? kerror/ExceptionInfo #"parameter type"
                           (marshal 'nested
                                    [[:record :maturity/nested
                                      [[:value [:record :maturity/pair
@@ -202,12 +202,12 @@
                     [[true Long/MAX_VALUE] [false -9]])))
     (doseq [bad [nil false [0] [false 0] [true] [true true]
                  [true 0 :extra] '(false)]]
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"tagged i64 value"
+      (is (thrown-with-msg? kerror/ExceptionInfo #"tagged i64 value"
                             (marshal 'option [:option-i64] [bad]))
           (pr-str bad)))
     (doseq [bad [nil [true] [false] [1 0] [true true]
                  [false 0 :extra] '(true 0)]]
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"tagged i64 value"
+      (is (thrown-with-msg? kerror/ExceptionInfo #"tagged i64 value"
                             (marshal 'result [:result-i64] [bad]))
           (pr-str bad)))))
 
@@ -223,7 +223,7 @@
                  [type :ready 1]
                  [type :count 1 :extra]
                  {:case :count :payload 1}]]
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"scalar variant"
+      (is (thrown-with-msg? kerror/ExceptionInfo #"scalar variant"
                             (marshal 'choose [type] [bad]))
           (pr-str bad)))))
 
@@ -256,16 +256,16 @@
   (let [admit! @#'executor/admit-validity!]
     (is (nil? (admit! open-session 1500)))
     (is (nil? (admit! open-session 1000)) "not-before is inclusive")
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"not yet valid"
+    (is (thrown-with-msg? kerror/ExceptionInfo #"not yet valid"
                           (admit! open-session 999)))
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"expired"
+    (is (thrown-with-msg? kerror/ExceptionInfo #"expired"
                           (admit! open-session 2000))
         "expiry is exclusive, as it is in signing/verify")
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"signer is revoked"
+    (is (thrown-with-msg? kerror/ExceptionInfo #"signer is revoked"
                           (admit! (assoc-in open-session [:trust :revoked-signers]
                                             #{"signer-a"})
                                   1500)))
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"artifact is revoked"
+    (is (thrown-with-msg? kerror/ExceptionInfo #"artifact is revoked"
                           (admit! (assoc-in open-session [:trust :revoked-artifacts]
                                             #{"artifact-a"})
                                   1500)))))
@@ -297,7 +297,7 @@
                                        (str "kotoba-session-test-" (System/nanoTime)))
                     (.mkdirs))
         session (fake-session directory)]
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"native session is closed"
+    (is (thrown-with-msg? kerror/ExceptionInfo #"native session is closed"
                           (executor/invoke session {} {:args [1]}
                                            {:now 1500 :entry 'identity})))
     (is (nil? (executor/close! session)))
@@ -305,7 +305,7 @@
     (is (not (.exists directory)))))
 
 (deftest an-invocation-names-the-session-format-it-accepts
-  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unknown native session"
+  (is (thrown-with-msg? kerror/ExceptionInfo #"unknown native session"
                         (executor/invoke {:format :kotoba.native-session/v0}
                                          {} {:args []} {:now 1500}))))
 
@@ -323,12 +323,12 @@
       (spit source "int main(void) { return 0; }\n")
       (is (= (.getCanonicalPath source)
              (.getCanonicalPath ^java.io.File (locate false (.getPath directory)))))
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"loader source was not found"
+      (is (thrown-with-msg? kerror/ExceptionInfo #"loader source was not found"
                             (locate false (.getPath (java.io.File. directory "absent"))))
           "a named directory that does not hold it is an error, not a fallback")
       (is (not= (.getCanonicalPath source)
                 (try (.getCanonicalPath ^java.io.File (locate true (.getPath directory)))
-                     (catch clojure.lang.ExceptionInfo _ ::refused)))
+                     (catch kerror/ExceptionInfo _ ::refused)))
           "the Windows loader is a different file and is not substituted for")
       (finally
         (doseq [file (reverse (file-seq directory))] (clojure.java.io/delete-file file true))))))
@@ -369,7 +369,7 @@
     (doseq [bad [{:region "0102"} {:region [1 2 256]} {:region [-1]}
                  {:region [1 nil]} {:region 5}]]
       (testing (pr-str bad)
-        (is (thrown? clojure.lang.ExceptionInfo (token 'e 0 bad)))))))
+        (is (thrown? kerror/ExceptionInfo (token 'e 0 bad)))))))
 
 (deftest a-region-past-the-pool-is-refused-here-and-not-only-at-the-loader
   ;; The loader refuses it too, and that is the point -- a gate on one route
@@ -377,7 +377,7 @@
   ;; naming its own argument rather than an exit code from a child process.
   (let [token @#'executor/region-argument-token]
     (is (some? (token 'e 0 {:region (vec (repeat 65536 0))})))
-    (is (thrown? clojure.lang.ExceptionInfo
+    (is (thrown? kerror/ExceptionInfo
                  (token 'e 0 {:region (vec (repeat 65537 0))})))))
 
 (deftest a-region-length-outside-the-loader-capacity-is-refused
@@ -385,7 +385,7 @@
     (doseq [bad [{:region-length 8} {:region-length -1} {:region-length "0"}
                  {:region-length nil}]]
       (testing (pr-str bad)
-        (is (thrown? clojure.lang.ExceptionInfo (token 'e 1 bad)))))))
+        (is (thrown? kerror/ExceptionInfo (token 'e 1 bad)))))))
 
 (deftest the-two-forms-are-told-apart-by-their-key
   (let [region? @#'executor/region-argument?

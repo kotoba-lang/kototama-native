@@ -216,6 +216,38 @@
     (is (false? (valid? (assoc-in unmetered [:fuel :metered] true) 0 unmetered-profile)))
     (is (false? (valid? (assoc-in metered [:fuel :remaining] 6007) 0 metered-profile)))))
 
+(deftest loader-refusals-name-what-is-wrong
+  ;; Absent and not-executable were reported as "measured native loader does
+  ;; not match runtime identity" until 2026-10-09 -- a loader looked up in the
+  ;; wrong directory read as a tampered one. Only wrong bytes say that now.
+  (let [admit @#'executor/measured-loader-bytes!
+        raw-sha256 @#'executor/raw-sha256
+        read-bytes @#'executor/read-bytes
+        dir (.mkdtempSync fs (.join node-path (.tmpdir os) "kexe-loader-test-"))
+        loader (.join node-path dir "kotoba-loader")
+        plain (.join node-path dir "plain-loader")
+        refusal (fn [path runtime]
+                  (try (admit path runtime) nil
+                       (catch :default e [(ex-message e) (:phase (ex-data e))])))]
+    (try
+      (.writeFileSync fs loader "loader bytes")
+      (.chmodSync fs loader 448)
+      (.writeFileSync fs plain "loader bytes")
+      (.chmodSync fs plain 384)
+      (let [runtime {:loader-binary-sha256 (raw-sha256 (read-bytes loader))}]
+        (is (= (raw-sha256 (read-bytes loader)) (raw-sha256 (admit loader runtime)))
+            "the measured loader is admitted and its bytes returned")
+        (is (= ["native execution requires a measured loader" :execute] (refusal nil runtime)))
+        (is (= [(str "native loader not found: " (.join node-path dir "missing")) :execute]
+               (refusal (.join node-path dir "missing") runtime)))
+        (is (= [(str "native loader not found: " dir) :execute] (refusal dir runtime))
+            "a directory is not a loader")
+        (is (= [(str "native loader is not executable: " plain) :execute] (refusal plain runtime)))
+        (is (= ["measured native loader does not match runtime identity" :runtime-identity]
+               (refusal loader {:loader-binary-sha256 (apply str (repeat 64 "0"))}))))
+      (finally
+        (.rmSync fs dir #js {:recursive true :force true})))))
+
 (defmethod t/report [:cljs.test/default :end-run-tests] [m]
   (let [ran (+ (:pass m) (:fail m) (:error m))]
     (println (str "SCANNED\t" ran " assertions, " (:fail m) " failures, " (:error m) " errors"))

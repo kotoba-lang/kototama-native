@@ -1416,6 +1416,30 @@
   #?(:clj (.canExecute ^java.io.File file)
      :cljs (executable-file? (str file))))
 
+(defn- measured-loader-bytes!
+  "The bytes of the loader at LOADER-PATH, admitted against RUNTIME's
+  `:loader-binary-sha256`. Each refusal says which thing is wrong: no path,
+  no file, a file that cannot be executed (`:execute`), or bytes that are not
+  the measured loader (`:runtime-identity`). Until 2026-10-09 the middle two
+  were reported as the last, and a loader looked up in the wrong directory
+  read as a tampered one (amu `run --loader kotoba-loader`)."
+  [loader-path runtime]
+  (when-not (and (string? loader-path) (seq loader-path))
+    (throw (ex-info "native execution requires a measured loader"
+                    {:phase :execute})))
+  (let [loader-source #?(:clj (io/file loader-path) :cljs loader-path)]
+    (when-not (file-exists? loader-source)
+      (throw (ex-info (str "native loader not found: " loader-path)
+                      {:phase :execute :loader loader-path})))
+    (when-not (can-execute? loader-source)
+      (throw (ex-info (str "native loader is not executable: " loader-path)
+                      {:phase :execute :loader loader-path})))
+    (let [loader-bytes (read-bytes loader-source)]
+      (when-not (= (:loader-binary-sha256 runtime) (raw-sha256 loader-bytes))
+        (throw (ex-info "measured native loader does not match runtime identity"
+                        {:phase :runtime-identity})))
+      loader-bytes)))
+
 (defn prepare
   "Verify a signed native artifact once and stage its measured execution
   environment. Returns a session usable for many `invoke` calls.
@@ -1474,16 +1498,7 @@
       (throw (ex-info "artifact and runtime target profiles do not match"
                       {:phase :runtime-identity})))
     (runtime-identity/admit! runtime trust)
-    (when-not (and (string? loader-path) (seq loader-path))
-      (throw (ex-info "native execution requires a measured loader"
-                      {:phase :execute})))
-    (let [loader-source #?(:clj (io/file loader-path) :cljs loader-path)
-          loader-bytes (when (file-exists? loader-source)
-                         (read-bytes loader-source))]
-      (when-not (and loader-bytes (can-execute? loader-source)
-                     (= (:loader-binary-sha256 runtime) (raw-sha256 loader-bytes)))
-        (throw (ex-info "measured native loader does not match runtime identity"
-                        {:phase :runtime-identity})))
+    (let [loader-bytes (measured-loader-bytes! loader-path runtime)]
       (let [directory (temp-directory "kotoba-native-")
             code-file (join-path directory "program.bin")
             loader (join-path directory (if (= :windows host-os-value)

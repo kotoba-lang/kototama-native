@@ -28,7 +28,8 @@
             [kotoba.verifier.signing :as signing]
             [kotoba.kir.target :as target-profile]
             #?@(:clj [[clojure.java.io :as io]]
-                :cljs [["node:child_process" :as child]
+                :cljs [[kototama.native.lease-transport :as lease-transport]
+                       ["node:child_process" :as child]
                        ["node:crypto" :as crypto]
                        ["node:fs" :as fs]
                        ["node:os" :as os]
@@ -1573,10 +1574,19 @@
                             (map str args))
               started-at (now-seconds)
               profile (fuel-profile artifact host-os)
-              process (run-process command (merge (fs-app-data-scope-env opts (runtime-environment host-os result))
-                                                  (:env profile))
-                                   {:timeout-ms (if (= :windows host-os) 60000 5000)
-                                    :output-limit (if (= :string result) 160000 65536)})
+              lease-call! (:lease-call! opts)
+              _ (when (and lease-call! (or (not (fn? lease-call!)) (= :windows host-os)))
+                  (throw (ex-info "unsupported native lease transport" {:phase :execute})))
+              process (if lease-call!
+                        #?(:clj (throw (ex-info "lease transport requires Node POSIX" {:phase :execute}))
+                           :cljs (lease-transport/run! command
+                                    (assoc (merge (runtime-environment host-os result) (:env profile))
+                                           "KEXE_LEASE_TRANSPORT" "i64-v2")
+                                    {:timeout-ms 5000 :output-limit 65536 :call! lease-call!}))
+                        (run-process command (merge (fs-app-data-scope-env opts (runtime-environment host-os result))
+                                                    (:env profile))
+                                     {:timeout-ms (if (= :windows host-os) 60000 5000)
+                                      :output-limit (if (= :string result) 160000 65536)}))
               finished-at (now-seconds)
               report (try (read-report (str/trim (:stdout process)))
                           (catch #?(:clj Exception :cljs :default) _ nil))

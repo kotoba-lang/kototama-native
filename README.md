@@ -124,3 +124,11 @@ and `amu run` on the host ISA.
 `test/tender/native_test.cljk` is the JVM suite. `kbb -M:test` reports
 `Ran 0 tests` since the `.cljk` rename (the JVM runner does not load that
 extension); it is kept as the origin of the fixtures the Node suite mirrors.
+
+## Scoped native lease transport
+
+The explicit POSIX Node v2 path forwards every unary i64 call to Kototama host
+lease reservation before a provider effect. The native host owns bounded IO and
+process supervision; Kototama owns authorization and its durable ledger.
+See [transport contract](docs/native-lease-transport.md). This is bootstrap host
+evidence; Q9/selfhost, Windows and aggregate transport remain separate.

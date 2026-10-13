@@ -78,7 +78,8 @@ checkable from outside. Do not merge this tree back into kototama core.
 
 - `kotoba-lang/osaho` (formerly `kotoba-kir`)
 - `kotoba-lang/artifact`
-- `kotoba-lang/kotoba-native`
+- `kotoba-lang/kotoba-verifier`
+- `kotoba-lang/error`, `kotoba-lang/bytes`, `kotoba-lang/text`, `kotoba-lang/test`
 
 ## Hosts
 
